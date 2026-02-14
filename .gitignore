@@ -1,10 +1,9 @@
 *
 !.gitignore
-!*.cpp
-!*.h
-!include/
-!include/**
-!gui/
-!gui/**
-!*.toml
-!*.png
+!src
+!src/*.cpp
+!src/*.h
+!src/gui/
+!src/gui/**
+!src/*.toml
+!src/*.png
