@@ -8,7 +8,7 @@
 // Toolscreen version information
 #define TOOLSCREEN_VERSION_MAJOR 1
 #define TOOLSCREEN_VERSION_MINOR 0
-#define TOOLSCREEN_VERSION_PATCH 0
+#define TOOLSCREEN_VERSION_PATCH 1
 
 // Config version for automatic upgrades
 #define CONFIG_VERSION 1
