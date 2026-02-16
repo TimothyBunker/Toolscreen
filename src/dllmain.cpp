@@ -1191,14 +1191,15 @@ BOOL WINAPI hkwglSwapBuffers(HDC hDc) {
                 if (currentContext) {
                     if (InitializeSharedContexts(currentContext, hDc)) {
                         LogCategory("init", "[RENDER] Shared contexts initialized - GPU texture sharing enabled for all threads");
-
-                        // Start ALL worker threads immediately while contexts are in the same share group
-                        StartRenderThread(currentContext);
-                        StartMirrorCaptureThread(currentContext);
-                        StartObsHookThread();
                     } else {
-                        Log("[RENDER] Shared context initialization failed - threads will use fallback");
+                        Log("[RENDER] Shared context initialization failed - starting worker threads in fallback mode");
                     }
+
+                    // ALWAYS start worker threads. They will automatically use the pre-shared contexts if available,
+                    // otherwise they fall back to creating/sharing their own contexts.
+                    StartRenderThread(currentContext);
+                    StartMirrorCaptureThread(currentContext);
+                    StartObsHookThread();
                 }
 
                 // Aggressively hook glViewport for AMD GPU compatibility
@@ -1226,12 +1227,14 @@ BOOL WINAPI hkwglSwapBuffers(HDC hDc) {
 
                 if (InitializeSharedContexts(currentContext, hDc)) {
                     Log("[RENDER] Reinitialized shared contexts after context change");
-                    StartRenderThread(currentContext);
-                    StartMirrorCaptureThread(currentContext);
-                    StartObsHookThread();
                 } else {
-                    Log("[RENDER] Failed to reinitialize shared contexts after context change - async overlays may be unavailable");
+                    Log("[RENDER] Failed to reinitialize shared contexts after context change - restarting threads in fallback mode");
                 }
+
+                // Restart worker threads regardless of shared-context init success.
+                StartRenderThread(currentContext);
+                StartMirrorCaptureThread(currentContext);
+                StartObsHookThread();
 
                 // Force recache of game texture IDs in the new context.
                 g_cachedGameTextureId.store(UINT_MAX, std::memory_order_release);

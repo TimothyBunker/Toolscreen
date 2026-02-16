@@ -13,7 +13,13 @@
 // Pre-created shared contexts (created on main thread, used by worker threads)
 extern std::atomic<HGLRC> g_sharedRenderContext;    // For render thread
 extern std::atomic<HGLRC> g_sharedMirrorContext;    // For mirror capture thread
-extern std::atomic<HDC> g_sharedContextDC;          // DC used to create contexts
+// IMPORTANT: Each worker thread must use its own DC/drawable.
+// Using the same HDC for two contexts on different threads is undefined on many drivers and
+// can result in black frames / invisible mirrors.
+extern std::atomic<HDC> g_sharedRenderContextDC;     // DC for render thread context
+extern std::atomic<HDC> g_sharedMirrorContextDC;     // DC for mirror capture thread context
+// Backward-compat (legacy). Prefer the specific getters below.
+extern std::atomic<HDC> g_sharedContextDC;
 
 // Whether shared contexts have been successfully initialized
 extern std::atomic<bool> g_sharedContextsReady;
@@ -32,6 +38,9 @@ void CleanupSharedContexts();
 // Returns the pre-shared context, or nullptr if not available
 HGLRC GetSharedRenderContext();
 HGLRC GetSharedMirrorContext();
+HDC GetSharedRenderContextDC();
+HDC GetSharedMirrorContextDC();
+// Backward-compat (legacy). Returns render DC.
 HDC GetSharedContextDC();
 
 // Check if shared contexts are ready

@@ -54,6 +54,7 @@ inline const std::string MIRROR_RENDER_RELATIVE_TO = "topLeft";
 constexpr int MIRROR_CAPTURE_WIDTH = 50;
 constexpr int MIRROR_CAPTURE_HEIGHT = 50;
 constexpr float MIRROR_COLOR_SENSITIVITY = 0.001f;
+inline const std::string MIRROR_GAMMA_MODE = "Auto";
 constexpr int MIRROR_FPS = 30;
 constexpr bool MIRROR_RAW_OUTPUT = false;
 constexpr bool MIRROR_COLOR_PASSTHROUGH = false;
@@ -241,6 +242,7 @@ constexpr int CONFIG_KEY_REPEAT_DELAY = 0;
 constexpr bool CONFIG_BASIC_MODE_ENABLED = false;
 constexpr bool CONFIG_DISABLE_FULLSCREEN_PROMPT = false;
 constexpr bool CONFIG_DISABLE_CONFIGURE_PROMPT = false;
+inline const std::string CONFIG_MIRROR_MATCH_COLORSPACE = "Auto";
 
 // Default GUI hotkey: LCtrl+I
 inline std::vector<DWORD> GetDefaultGuiHotkey() { return { VK_LCONTROL, 'I' }; }

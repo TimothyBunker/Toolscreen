@@ -36,6 +36,34 @@ if (ImGui::BeginTabItem("Settings")) {
     ImGui::SameLine();
     HelpMarker("Disables the configure toast prompt (toast1) shown in windowed mode.");
 
+    ImGui::Spacing();
+    ImGui::SeparatorText("Mirrors");
+    {
+        const char* gammaModes[] = { "Auto", "Assume sRGB", "Assume Linear" };
+        int gm = static_cast<int>(g_config.mirrorGammaMode);
+        ImGui::SetNextItemWidth(250);
+        if (ImGui::Combo("Match Colorspace", &gm, gammaModes, IM_ARRAYSIZE(gammaModes))) {
+            g_config.mirrorGammaMode = static_cast<MirrorGammaMode>(gm);
+            g_configIsDirty = true;
+
+            // Apply immediately for runtime (does not require saving)
+            SetGlobalMirrorGammaMode(g_config.mirrorGammaMode);
+
+            // Force mirrors to recapture with the new mode
+            std::unique_lock<std::shared_mutex> lock(g_mirrorInstancesMutex);
+            for (auto& kv : g_mirrorInstances) {
+                kv.second.forceUpdateFrames = 3;
+                kv.second.hasValidContent = false;
+            }
+        }
+        ImGui::SameLine();
+        HelpMarker("Controls how mirror color matching interprets the captured pixels.\n"
+                   "Applies globally to all mirrors.\n\n"
+                   "Auto: tries both sRGB-space and linear-space matching and uses the better match.\n"
+                   "Assume sRGB: converts sampled pixels + target colors to linear for matching.\n"
+                   "Assume Linear: treats sampled pixels as linear; converts only target colors.");
+    }
+
     // Virtual Camera
     bool driverInstalled = IsVirtualCameraDriverInstalled();
     bool inUseByOBS = driverInstalled && IsVirtualCameraInUseByOBS();

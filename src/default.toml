@@ -5,6 +5,7 @@ defaultMode = 'Fullscreen'
 fontPath = 'C:\Windows\Fonts\Arial.ttf'
 fpsLimit = 0
 fpsLimitSleepThreshold = 1000
+mirrorMatchColorspace = 'Auto'
 guiHotkey = [ 162, 73 ]
 hideAnimationsInGame = true
 disableFullscreenPrompt = false

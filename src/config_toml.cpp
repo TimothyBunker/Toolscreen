@@ -317,6 +317,23 @@ void MirrorColorsFromToml(const toml::table& tbl, MirrorColors& cfg) {
 // MirrorBorderConfig Serialization
 // ============================================================================
 
+static std::string MirrorGammaModeToString(MirrorGammaMode mode) {
+    switch (mode) {
+    case MirrorGammaMode::AssumeSRGB:
+        return "SRGB";
+    case MirrorGammaMode::AssumeLinear:
+        return "Linear";
+    default:
+        return "Auto";
+    }
+}
+
+static MirrorGammaMode StringToMirrorGammaMode(const std::string& str) {
+    if (str == "SRGB" || str == "sRGB" || str == "srgb") return MirrorGammaMode::AssumeSRGB;
+    if (str == "Linear" || str == "linear") return MirrorGammaMode::AssumeLinear;
+    return MirrorGammaMode::Auto;
+}
+
 std::string MirrorBorderTypeToString(MirrorBorderType type) {
     switch (type) {
     case MirrorBorderType::Static:
@@ -1323,6 +1340,7 @@ void ConfigToToml(const Config& config, toml::table& out) {
     out.insert("fontPath", config.fontPath);
     out.insert("fpsLimit", config.fpsLimit);
     out.insert("fpsLimitSleepThreshold", config.fpsLimitSleepThreshold);
+    out.insert("mirrorMatchColorspace", MirrorGammaModeToString(config.mirrorGammaMode));
     out.insert("allowCursorEscape", config.allowCursorEscape);
     out.insert("mouseSensitivity", config.mouseSensitivity);
     out.insert("windowsMouseSpeed", config.windowsMouseSpeed);
@@ -1433,6 +1451,9 @@ void ConfigFromToml(const toml::table& tbl, Config& config) {
     config.fontPath = GetStringOr(tbl, "fontPath", ConfigDefaults::CONFIG_FONT_PATH);
     config.fpsLimit = GetOr(tbl, "fpsLimit", ConfigDefaults::CONFIG_FPS_LIMIT);
     config.fpsLimitSleepThreshold = GetOr(tbl, "fpsLimitSleepThreshold", ConfigDefaults::CONFIG_FPS_LIMIT_SLEEP_THRESHOLD);
+    bool hasGlobalMirrorMatchColorspace = tbl.contains("mirrorMatchColorspace");
+    config.mirrorGammaMode = StringToMirrorGammaMode(
+        GetStringOr(tbl, "mirrorMatchColorspace", ConfigDefaults::CONFIG_MIRROR_MATCH_COLORSPACE));
     config.allowCursorEscape = GetOr(tbl, "allowCursorEscape", ConfigDefaults::CONFIG_ALLOW_CURSOR_ESCAPE);
     config.mouseSensitivity = GetOr(tbl, "mouseSensitivity", ConfigDefaults::CONFIG_MOUSE_SENSITIVITY);
     config.windowsMouseSpeed = GetOr(tbl, "windowsMouseSpeed", ConfigDefaults::CONFIG_WINDOWS_MOUSE_SPEED);
@@ -1484,6 +1505,12 @@ void ConfigFromToml(const toml::table& tbl, Config& config) {
     if (auto arr = GetArray(tbl, "mirror")) {
         for (const auto& elem : *arr) {
             if (auto t = elem.as_table()) {
+                // Backward compatibility: old per-mirror gammaMode setting.
+                // If the new global key isn't present, adopt the first mirror's gammaMode as the global setting.
+                if (!hasGlobalMirrorMatchColorspace && t->contains("gammaMode")) {
+                    config.mirrorGammaMode = StringToMirrorGammaMode(GetStringOr(*t, "gammaMode", ConfigDefaults::CONFIG_MIRROR_MATCH_COLORSPACE));
+                    hasGlobalMirrorMatchColorspace = true;
+                }
                 MirrorConfig mirror;
                 MirrorConfigFromToml(*t, mirror);
                 config.mirrors.push_back(mirror);

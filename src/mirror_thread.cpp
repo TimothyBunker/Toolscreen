@@ -6,6 +6,7 @@
 #include "shared_contexts.h"
 #include "utils.h"
 #include <algorithm>
+#include <unordered_map>
 #include <thread>
 
 // Thread runs independently, capturing game content to back-buffer FBOs
@@ -64,6 +65,59 @@ static std::atomic<int> g_readyFrameIndex{ -1 }; // Index of guaranteed-complete
 static std::atomic<int> g_readyFrameWidth{ 0 };  // Width of ready frame content
 static std::atomic<int> g_readyFrameHeight{ 0 }; // Height of ready frame content
 
+// Global mirror colorspace matching mode (applies to all mirrors)
+static std::atomic<int> g_globalMirrorGammaMode{ static_cast<int>(MirrorGammaMode::Auto) };
+
+void SetGlobalMirrorGammaMode(MirrorGammaMode mode) {
+    g_globalMirrorGammaMode.store(static_cast<int>(mode), std::memory_order_release);
+}
+
+MirrorGammaMode GetGlobalMirrorGammaMode() {
+    int v = g_globalMirrorGammaMode.load(std::memory_order_acquire);
+    if (v < 0 || v > 2) return MirrorGammaMode::Auto;
+    return static_cast<MirrorGammaMode>(v);
+}
+
+static void MT_LogSharedContextHealthOnce() {
+    static std::atomic<bool> s_logged{ false };
+    bool expected = false;
+    if (!s_logged.compare_exchange_strong(expected, true)) { return; }
+
+    const char* vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+    const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+
+    LogCategory("init", std::string("Mirror Capture Thread: GL_VENDOR=") + (vendor ? vendor : "<null>"));
+    LogCategory("init", std::string("Mirror Capture Thread: GL_RENDERER=") + (renderer ? renderer : "<null>"));
+    LogCategory("init", std::string("Mirror Capture Thread: GL_VERSION=") + (version ? version : "<null>"));
+
+    // Validate that the shared copy textures created on the game context are visible here.
+    // If these are not visible, mirrors/raw output will never work.
+    for (int i = 0; i < 2; i++) {
+        GLuint tex = g_copyTextures[i];
+        if (tex == 0) {
+            LogCategory("init", "Mirror Capture Thread: g_copyTextures[" + std::to_string(i) + "] = 0 (not initialized yet)");
+            continue;
+        }
+
+        GLboolean isTex = glIsTexture(tex);
+        GLint w = 0, h = 0, ifmt = 0;
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        LogCategory("init", "Mirror Capture Thread: shared copy tex[" + std::to_string(i) + "] id=" + std::to_string(tex) +
+                                " glIsTexture=" + std::to_string((int)isTex) + " size=" + std::to_string(w) + "x" +
+                                std::to_string(h) + " ifmt=" + std::to_string(ifmt));
+    }
+
+    // Clear any errors so subsequent GL error checks are meaningful.
+    while (glGetError() != GL_NO_ERROR) {
+    }
+}
+
 // Note: OBS capture is now handled by obs_thread.cpp via glBlitFramebuffer hook
 
 // ============================================================================
@@ -88,19 +142,43 @@ out vec4 FragColor;
 in vec2 TexCoord;
 uniform sampler2D screenTexture;
 uniform vec4 u_sourceRect;
+uniform int u_gammaMode;       // 0=Auto, 1=Assume sRGB, 2=Assume Linear
 uniform vec3 u_targetColors[8];  // Support up to 8 target colors
 uniform int u_targetColorCount;  // Number of active target colors
 uniform vec4 outputColor;
 uniform float u_sensitivity;
+
+vec3 SRGBToLinear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
 void main() {
     vec2 srcCoord = u_sourceRect.xy + TexCoord * u_sourceRect.zw;
-    vec3 screenColorSRGB = texture(screenTexture, srcCoord).rgb;
-    vec3 screenColorLinear = pow(screenColorSRGB, vec3(2.2));
+    vec3 screenColor = texture(screenTexture, srcCoord).rgb;
+    vec3 screenColorLinear = SRGBToLinear(screenColor);
     
     bool matches = false;
     for (int i = 0; i < u_targetColorCount; i++) {
-        vec3 targetColorLinear = pow(u_targetColors[i], vec3(2.2));
-        if (distance(screenColorLinear, targetColorLinear) < u_sensitivity) {
+        vec3 targetColorSRGB = u_targetColors[i];
+        vec3 targetColorLinear = SRGBToLinear(targetColorSRGB);
+
+        float dist;
+        if (u_gammaMode == 2) {
+            // Assume input is linear (targets are sRGB -> convert targets only)
+            dist = distance(screenColor, targetColorLinear);
+        } else if (u_gammaMode == 1) {
+            // Assume input is sRGB (convert both input+target to linear)
+            dist = distance(screenColorLinear, targetColorLinear);
+        } else {
+            // Auto: evaluate both distances and accept the better match.
+            float distSRGB = distance(screenColor, targetColorSRGB);
+            float distLinear = distance(screenColorLinear, targetColorLinear);
+            dist = min(distSRGB, distLinear);
+        }
+
+        if (dist < u_sensitivity) {
             matches = true;
             break;
         }
@@ -120,18 +198,39 @@ out vec4 FragColor;
 in vec2 TexCoord;
 uniform sampler2D screenTexture;
 uniform vec4 u_sourceRect;
+uniform int u_gammaMode;       // 0=Auto, 1=Assume sRGB, 2=Assume Linear
 uniform vec3 u_targetColors[8];  // Support up to 8 target colors
 uniform int u_targetColorCount;  // Number of active target colors
 uniform float u_sensitivity;
+
+vec3 SRGBToLinear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
 void main() {
     vec2 srcCoord = u_sourceRect.xy + TexCoord * u_sourceRect.zw;
-    vec3 screenColorSRGB = texture(screenTexture, srcCoord).rgb;
-    vec3 screenColorLinear = pow(screenColorSRGB, vec3(2.2));
+    vec3 screenColor = texture(screenTexture, srcCoord).rgb;
+    vec3 screenColorLinear = SRGBToLinear(screenColor);
     
     bool matches = false;
     for (int i = 0; i < u_targetColorCount; i++) {
-        vec3 targetColorLinear = pow(u_targetColors[i], vec3(2.2));
-        if (distance(screenColorLinear, targetColorLinear) < u_sensitivity) {
+        vec3 targetColorSRGB = u_targetColors[i];
+        vec3 targetColorLinear = SRGBToLinear(targetColorSRGB);
+
+        float dist;
+        if (u_gammaMode == 2) {
+            dist = distance(screenColor, targetColorLinear);
+        } else if (u_gammaMode == 1) {
+            dist = distance(screenColorLinear, targetColorLinear);
+        } else {
+            float distSRGB = distance(screenColor, targetColorSRGB);
+            float distLinear = distance(screenColorLinear, targetColorLinear);
+            dist = min(distSRGB, distLinear);
+        }
+
+        if (dist < u_sensitivity) {
             matches = true;
             break;
         }
@@ -139,7 +238,7 @@ void main() {
     
     if (matches) {
         // Output the original pixel color (passthrough)
-        FragColor = vec4(screenColorSRGB, 1.0);
+        FragColor = vec4(screenColor, 1.0);
     } else {
         FragColor = vec4(0.0, 0.0, 0.0, 0.0);
     }
@@ -319,6 +418,7 @@ static GLuint mt_staticBorderProgram = 0;      // Static border shape shader
 // Uniform locations for local shaders
 struct MT_FilterShaderLocs {
     GLint screenTexture = -1, sourceRect = -1;
+    GLint gammaMode = -1;
     GLint targetColors = -1;     // Array of target colors (up to 8)
     GLint targetColorCount = -1; // Number of active target colors
     GLint outputColor = -1, sensitivity = -1;
@@ -326,6 +426,7 @@ struct MT_FilterShaderLocs {
 // Color passthrough filter shader uniform locations (no outputColor since it uses original pixel)
 struct MT_FilterPassthroughShaderLocs {
     GLint screenTexture = -1, sourceRect = -1;
+    GLint gammaMode = -1;
     GLint targetColors = -1;     // Array of target colors (up to 8)
     GLint targetColorCount = -1; // Number of active target colors
     GLint sensitivity = -1;
@@ -420,6 +521,7 @@ static bool MT_InitializeShaders() {
     // Get uniform locations for basic shaders
     mt_filterShaderLocs.screenTexture = glGetUniformLocation(mt_filterProgram, "screenTexture");
     mt_filterShaderLocs.sourceRect = glGetUniformLocation(mt_filterProgram, "u_sourceRect");
+    mt_filterShaderLocs.gammaMode = glGetUniformLocation(mt_filterProgram, "u_gammaMode");
     mt_filterShaderLocs.targetColors = glGetUniformLocation(mt_filterProgram, "u_targetColors");
     mt_filterShaderLocs.targetColorCount = glGetUniformLocation(mt_filterProgram, "u_targetColorCount");
     mt_filterShaderLocs.outputColor = glGetUniformLocation(mt_filterProgram, "outputColor");
@@ -428,6 +530,7 @@ static bool MT_InitializeShaders() {
     // Get uniform locations for color passthrough filter shader
     mt_filterPassthroughShaderLocs.screenTexture = glGetUniformLocation(mt_filterPassthroughProgram, "screenTexture");
     mt_filterPassthroughShaderLocs.sourceRect = glGetUniformLocation(mt_filterPassthroughProgram, "u_sourceRect");
+    mt_filterPassthroughShaderLocs.gammaMode = glGetUniformLocation(mt_filterPassthroughProgram, "u_gammaMode");
     mt_filterPassthroughShaderLocs.targetColors = glGetUniformLocation(mt_filterPassthroughProgram, "u_targetColors");
     mt_filterPassthroughShaderLocs.targetColorCount = glGetUniformLocation(mt_filterPassthroughProgram, "u_targetColorCount");
     mt_filterPassthroughShaderLocs.sensitivity = glGetUniformLocation(mt_filterPassthroughProgram, "u_sensitivity");
@@ -460,9 +563,11 @@ static bool MT_InitializeShaders() {
     // Set texture sampler uniforms once
     glUseProgram(mt_filterProgram);
     glUniform1i(mt_filterShaderLocs.screenTexture, 0);
+    if (mt_filterShaderLocs.gammaMode >= 0) { glUniform1i(mt_filterShaderLocs.gammaMode, 0); }
 
     glUseProgram(mt_filterPassthroughProgram);
     glUniform1i(mt_filterPassthroughShaderLocs.screenTexture, 0);
+    if (mt_filterPassthroughShaderLocs.gammaMode >= 0) { glUniform1i(mt_filterPassthroughShaderLocs.gammaMode, 0); }
 
     glUseProgram(mt_passthroughProgram);
     glUniform1i(mt_passthroughShaderLocs.screenTexture, 0);
@@ -626,6 +731,9 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     GLint prevTexture2D = 0;
     GLfloat prevClearColor[4] = { 0, 0, 0, 0 };
     GLboolean prevColorMask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
+    GLboolean prevDither = GL_FALSE;
+    GLboolean prevFramebufferSRGB = GL_FALSE;
+    bool hasFramebufferSRGB = false;
 
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFBO);
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFBO);
@@ -635,6 +743,16 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     glGetFloatv(GL_COLOR_CLEAR_VALUE, prevClearColor);
     glGetBooleanv(GL_COLOR_WRITEMASK, prevColorMask);
 
+    // Some drivers apply dithering when converting to RGBA8 during blits/writes.
+    // That can introduce small per-pixel differences, making color matching require higher sensitivity.
+    prevDither = glIsEnabled(GL_DITHER);
+
+    // Framebuffer sRGB can also change conversion behavior on some paths. Guard because older contexts may not support it.
+    hasFramebufferSRGB = (GLEW_VERSION_3_0 || GLEW_EXT_framebuffer_sRGB || GLEW_ARB_framebuffer_sRGB);
+    if (hasFramebufferSRGB) {
+        prevFramebufferSRGB = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+    }
+
     auto restoreState = [&]() {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFBO);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFBO);
@@ -643,7 +761,23 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
         glClearColor(prevClearColor[0], prevClearColor[1], prevClearColor[2], prevClearColor[3]);
         glActiveTexture(prevActiveTexture);
         glBindTexture(GL_TEXTURE_2D, prevTexture2D);
+
+        if (prevDither)
+            glEnable(GL_DITHER);
+        else
+            glDisable(GL_DITHER);
+
+        if (hasFramebufferSRGB) {
+            if (prevFramebufferSRGB)
+                glEnable(GL_FRAMEBUFFER_SRGB);
+            else
+                glDisable(GL_FRAMEBUFFER_SRGB);
+        }
     };
+
+    // Force deterministic conversion during copy.
+    glDisable(GL_DITHER);
+    if (hasFramebufferSRGB) { glDisable(GL_FRAMEBUFFER_SRGB); }
 
     // Resize copy textures to match game content EXACTLY
     // This ensures UV coordinates work correctly for mirrors (no need to scale UVs)
@@ -680,6 +814,12 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     // Check if source FBO is complete - game texture might be invalid during WM_SIZE resize
     GLenum srcStatus = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
     if (srcStatus != GL_FRAMEBUFFER_COMPLETE) {
+        static int s_srcIncompleteLog = 0;
+        if ((++s_srcIncompleteLog % 240) == 1) {
+            LogCategory("texture_ops",
+                        "SubmitFrameCapture: Source FBO incomplete (status " + std::to_string(srcStatus) + ") gameTex=" +
+                            std::to_string(gameTexture) + " size=" + std::to_string(width) + "x" + std::to_string(height));
+        }
         // Game texture is in a bad state (probably being recreated due to WM_SIZE)
         // Skip this frame's capture - the next frame will have a valid texture
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
@@ -688,6 +828,7 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
         return;
     }
 
+
     // Bind copy FBO as draw target with the write texture
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_copyFBO);
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_copyTextures[writeIndex], 0);
@@ -695,6 +836,13 @@ void SubmitFrameCapture(GLuint gameTexture, int width, int height) {
     // Check if destination FBO is complete
     GLenum dstStatus = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
     if (dstStatus != GL_FRAMEBUFFER_COMPLETE) {
+        static int s_dstIncompleteLog = 0;
+        if ((++s_dstIncompleteLog % 240) == 1) {
+            LogCategory("texture_ops",
+                        "SubmitFrameCapture: Destination FBO incomplete (status " + std::to_string(dstStatus) + ") writeIdx=" +
+                            std::to_string(writeIndex) + " dstTex=" + std::to_string(g_copyTextures[writeIndex]) + " size=" +
+                            std::to_string(width) + "x" + std::to_string(height));
+        }
         // Our copy texture is in a bad state - skip this frame
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
@@ -826,11 +974,12 @@ static void ComputeMirrorRenderCache(MirrorInstance* inst, const ThreadedMirrorC
 // Helper: Render a single mirror to its back buffer
 // Returns true if rendering succeeded
 static bool RenderMirrorToBackBuffer(MirrorInstance* inst, const ThreadedMirrorConfig& conf, GLuint validCopyTexture, GLuint captureVAO,
-                                     GLuint captureVBO, int gameW, int gameH) {
+                                     GLuint captureVBO, GLuint captureBackFbo, GLuint captureFinalBackFbo, MirrorGammaMode gammaMode,
+                                     int gameW, int gameH) {
     PROFILE_SCOPE_CAT("Capture Single Mirror", "Mirror Thread");
 
     // Capture to back buffer
-    glBindFramebuffer(GL_FRAMEBUFFER, inst->fboBack);
+    glBindFramebuffer(GL_FRAMEBUFFER, captureBackFbo);
     if (oglViewport)
         oglViewport(0, 0, inst->fbo_w, inst->fbo_h);
     else
@@ -862,6 +1011,9 @@ static bool RenderMirrorToBackBuffer(MirrorInstance* inst, const ThreadedMirrorC
         // Color passthrough mode: output original pixel color when matching target colors
         glUseProgram(mt_filterPassthroughProgram);
         glUniform1i(mt_filterPassthroughShaderLocs.screenTexture, 0);
+        if (mt_filterPassthroughShaderLocs.gammaMode >= 0) {
+            glUniform1i(mt_filterPassthroughShaderLocs.gammaMode, static_cast<int>(gammaMode));
+        }
 
         // Pass multiple target colors to shader (max 8)
         int colorCount = (std::min)(static_cast<int>(conf.targetColors.size()), 8);
@@ -877,6 +1029,9 @@ static bool RenderMirrorToBackBuffer(MirrorInstance* inst, const ThreadedMirrorC
     } else {
         glUseProgram(mt_filterProgram);
         glUniform1i(mt_filterShaderLocs.screenTexture, 0);
+        if (mt_filterShaderLocs.gammaMode >= 0) {
+            glUniform1i(mt_filterShaderLocs.gammaMode, static_cast<int>(gammaMode));
+        }
 
         // Pass multiple target colors to shader (max 8)
         int colorCount = (std::min)(static_cast<int>(conf.targetColors.size()), 8);
@@ -959,14 +1114,15 @@ static bool RenderMirrorToBackBuffer(MirrorInstance* inst, const ThreadedMirrorC
     }
     inst->hasFrameContentBack = hasContent;
 
-    // === PASS 2: Apply border shader and render to finalFboBack ===
-    // This produces screen-ready content so render thread just needs to blit
-    if (inst->finalFboBack != 0 && inst->finalTextureBack != 0) {
+    // === PASS 2: Apply border shader and render to final texture ===
+    // This produces screen-ready content so render thread just needs to blit.
+    // IMPORTANT: Use the mirror-thread-local FBO (framebuffer objects may not be shared across contexts).
+    if (captureFinalBackFbo != 0 && inst->finalTextureBack != 0) {
         PROFILE_SCOPE_CAT("Apply Border Shader", "Mirror Thread");
 
         if (useRawOutput) {
             // Raw output: just passthrough, no borders
-            glBindFramebuffer(GL_FRAMEBUFFER, inst->finalFboBack);
+            glBindFramebuffer(GL_FRAMEBUFFER, captureFinalBackFbo);
             if (oglViewport)
                 oglViewport(0, 0, inst->final_w_back, inst->final_h_back);
             else
@@ -985,7 +1141,7 @@ static bool RenderMirrorToBackBuffer(MirrorInstance* inst, const ThreadedMirrorC
         } else if (conf.borderType == MirrorBorderType::Static) {
             // Static border mode: just passthrough the filter output (no dynamic border shader)
             // Static border will be rendered later in render_thread.cpp on top of the mirror
-            glBindFramebuffer(GL_FRAMEBUFFER, inst->finalFboBack);
+            glBindFramebuffer(GL_FRAMEBUFFER, captureFinalBackFbo);
             if (oglViewport)
                 oglViewport(0, 0, inst->final_w_back, inst->final_h_back);
             else
@@ -1003,7 +1159,7 @@ static bool RenderMirrorToBackBuffer(MirrorInstance* inst, const ThreadedMirrorC
             glDrawArrays(GL_TRIANGLES, 0, 6);
         } else {
             // Dynamic border mode: apply the border render shader
-            glBindFramebuffer(GL_FRAMEBUFFER, inst->finalFboBack);
+            glBindFramebuffer(GL_FRAMEBUFFER, captureFinalBackFbo);
             if (oglViewport)
                 oglViewport(0, 0, inst->final_w_back, inst->final_h_back);
             else
@@ -1042,6 +1198,16 @@ static bool RenderMirrorToBackBuffer(MirrorInstance* inst, const ThreadedMirrorC
     return true;
 }
 
+// Mirror-thread local FBOs.
+// IMPORTANT: Framebuffer objects are not reliably shared between WGL contexts across all drivers.
+// We therefore create FBO objects on the mirror capture context and only attach the shared textures.
+struct MT_MirrorFbos {
+    GLuint backFbo = 0;       // attaches inst->fboTextureBack
+    GLuint finalBackFbo = 0;  // attaches inst->finalTextureBack
+    GLuint lastBackTex = 0;
+    GLuint lastFinalBackTex = 0;
+};
+
 static void MirrorCaptureThreadFunc(void* unused) {
     _set_se_translator(SEHTranslator);
 
@@ -1078,6 +1244,9 @@ static void MirrorCaptureThreadFunc(void* unused) {
             return;
         }
 
+        // One-time diagnostics about whether shared textures are visible in this context.
+        MT_LogSharedContextHealthOnce();
+
         Log("Mirror Capture Thread: Thread loop running");
 
         // Create local VAO/VBO for rendering
@@ -1100,6 +1269,70 @@ static void MirrorCaptureThreadFunc(void* unused) {
         GLuint validTexture = 0;
         int validW = 0, validH = 0;
         bool hasValidTexture = false;
+
+
+        // Per-mirror FBOs created on THIS context.
+        std::unordered_map<std::string, MT_MirrorFbos> mt_fbos;
+
+        // Debug: sample pixels from the shared copy texture (only when Texture Ops logging is enabled)
+        GLuint debugSampleFbo = 0;
+        auto debugSamplePixel = [&](const ThreadedMirrorConfig& conf, GLuint srcTex, int gameW, int gameH) {
+            auto snap = GetConfigSnapshot();
+            if (!snap || !snap->debug.logTextureOps) return;
+            if (srcTex == 0 || gameW <= 0 || gameH <= 0) return;
+            if (conf.input.empty()) return;
+
+            // Rate limit: once every ~2 seconds at 60fps (per thread, not per mirror)
+            static int s_sampleCounter = 0;
+            if ((++s_sampleCounter % 120) != 0) return;
+
+            if (debugSampleFbo == 0) { glGenFramebuffers(1, &debugSampleFbo); }
+
+            // Sample center of the first input region.
+            const auto& r = conf.input[0];
+            int capX = 0, capY = 0;
+            GetRelativeCoords(r.relativeTo, r.x, r.y, conf.captureWidth, conf.captureHeight, gameW, gameH, capX, capY);
+            int capY_gl = gameH - capY - conf.captureHeight;
+            int sampleX = capX + conf.captureWidth / 2;
+            int sampleY = capY_gl + conf.captureHeight / 2;
+            if (sampleX < 0) sampleX = 0;
+            if (sampleY < 0) sampleY = 0;
+            if (sampleX >= gameW) sampleX = gameW - 1;
+            if (sampleY >= gameH) sampleY = gameH - 1;
+
+            GLint prevReadFbo = 0;
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, debugSampleFbo);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, srcTex, 0);
+            GLenum st = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+            if (st != GL_FRAMEBUFFER_COMPLETE) {
+                LogCategory("texture_ops",
+                            "MirrorDebugSample: READ FBO incomplete for mirror '" + conf.name + "' (status " + std::to_string(st) +
+                                ") tex=" + std::to_string(srcTex));
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
+                return;
+            }
+
+            unsigned char px[4] = { 0, 0, 0, 0 };
+            glReadPixels(sampleX, sampleY, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
+
+            // Log first target color too (if present)
+            int tR = -1, tG = -1, tB = -1;
+            if (!conf.targetColors.empty()) {
+                tR = (int)std::round(conf.targetColors[0].r * 255.0f);
+                tG = (int)std::round(conf.targetColors[0].g * 255.0f);
+                tB = (int)std::round(conf.targetColors[0].b * 255.0f);
+            }
+
+            MirrorGammaMode gm = GetGlobalMirrorGammaMode();
+            LogCategory("texture_ops",
+                        "MirrorDebugSample: '" + conf.name + "' sample(" + std::to_string(sampleX) + "," + std::to_string(sampleY) +
+                            ") rgba=" + std::to_string((int)px[0]) + "," + std::to_string((int)px[1]) + "," +
+                            std::to_string((int)px[2]) + "," + std::to_string((int)px[3]) +
+                            " target0=" + std::to_string(tR) + "," + std::to_string(tG) + "," + std::to_string(tB) +
+                            " sens=" + std::to_string(conf.colorSensitivity) + " gammaMode=" + std::to_string((int)gm));
+        };
 
         while (!g_mirrorCaptureShouldStop.load()) {
             PROFILE_SCOPE_CAT("Mirror Capture Thread Frame", "Mirror Thread");
@@ -1145,6 +1378,21 @@ static void MirrorCaptureThreadFunc(void* unused) {
                         validH = notif.height;
                         hasValidTexture = true;
 
+                        // Low-frequency diagnostics: confirm the chosen texture is actually visible here.
+                        static int s_diagCounter = 0;
+                        if ((++s_diagCounter % 300) == 0) {
+                            GLboolean isTex = glIsTexture(validTexture);
+                            GLint tw = 0, th = 0;
+                            glBindTexture(GL_TEXTURE_2D, validTexture);
+                            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+                            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+                            glBindTexture(GL_TEXTURE_2D, 0);
+                            LogCategory("texture_ops",
+                                        "Mirror Capture Thread: Using copy texture idx=" + std::to_string(readIndex) +
+                                            " id=" + std::to_string(validTexture) + " glIsTexture=" + std::to_string((int)isTex) +
+                                            " size=" + std::to_string(tw) + "x" + std::to_string(th));
+                        }
+
                         // === CRITICAL: Publish ready frame for OBS ===
                         // This must happen HERE, immediately after fence signals,
                         // NOT after mirror processing. This ensures OBS works even without mirrors.
@@ -1177,6 +1425,9 @@ static void MirrorCaptureThreadFunc(void* unused) {
                 continue;
             }
 
+            // Global colorspace mode for matching (applies to all mirrors)
+            MirrorGammaMode gammaMode = GetGlobalMirrorGammaMode();
+
             // Process each mirror using the copied texture
             bool didCapture = false;
             for (auto& conf : configs) {
@@ -1189,6 +1440,8 @@ static void MirrorCaptureThreadFunc(void* unused) {
 
                 // Get mirror instance (unique lock - capture thread writes to instance)
                 MirrorInstance* inst = nullptr;
+                GLuint localBackFbo = 0;
+                GLuint localFinalBackFbo = 0;
                 {
                     std::unique_lock<std::shared_mutex> lock(g_mirrorInstancesMutex);
                     auto it = g_mirrorInstances.find(conf.name);
@@ -1208,7 +1461,7 @@ static void MirrorCaptureThreadFunc(void* unused) {
 
                         // Resize front texture - use NEAREST for sharp pixel-perfect scaling (front/back get swapped)
                         glBindTexture(GL_TEXTURE_2D, inst->fboTexture);
-                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, inst->fbo_w, inst->fbo_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, inst->fbo_w, inst->fbo_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1217,7 +1470,7 @@ static void MirrorCaptureThreadFunc(void* unused) {
                         // Resize back texture
                         // Use GL_NEAREST for sharp pixel-perfect scaling
                         glBindTexture(GL_TEXTURE_2D, inst->fboTextureBack);
-                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, inst->fbo_w, inst->fbo_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, inst->fbo_w, inst->fbo_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1239,7 +1492,7 @@ static void MirrorCaptureThreadFunc(void* unused) {
 
                         // Resize back final texture only
                         glBindTexture(GL_TEXTURE_2D, inst->finalTextureBack);
-                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, requiredFinalW, requiredFinalH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, requiredFinalW, requiredFinalH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1253,10 +1506,40 @@ static void MirrorCaptureThreadFunc(void* unused) {
                         // Invalidate back cache since dimensions changed (front cache stays valid until swap)
                         inst->cachedRenderStateBack.isValid = false;
                     }
+
+                    // Ensure mirror-thread-local FBOs exist and are attached to the current back textures.
+                    // NOTE: We must NOT rely on inst->fboBack / inst->finalFboBack being usable in this context.
+                    // Those may have been created on the game context.
+                    MT_MirrorFbos& fb = mt_fbos[conf.name];
+                    if (fb.backFbo == 0) { glGenFramebuffers(1, &fb.backFbo); }
+                    if (fb.finalBackFbo == 0) { glGenFramebuffers(1, &fb.finalBackFbo); }
+
+                    if (fb.lastBackTex != inst->fboTextureBack) {
+                        glBindFramebuffer(GL_FRAMEBUFFER, fb.backFbo);
+                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, inst->fboTextureBack, 0);
+                        GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                        if (st != GL_FRAMEBUFFER_COMPLETE) {
+                            Log("Mirror Capture Thread: backFbo incomplete for '" + conf.name + "' (status " + std::to_string(st) + ")");
+                        }
+                        fb.lastBackTex = inst->fboTextureBack;
+                    }
+
+                    if (fb.lastFinalBackTex != inst->finalTextureBack) {
+                        glBindFramebuffer(GL_FRAMEBUFFER, fb.finalBackFbo);
+                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, inst->finalTextureBack, 0);
+                        GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                        if (st != GL_FRAMEBUFFER_COMPLETE) {
+                            Log("Mirror Capture Thread: finalBackFbo incomplete for '" + conf.name + "' (status " + std::to_string(st) + ")");
+                        }
+                        fb.lastFinalBackTex = inst->finalTextureBack;
+                    }
+
+                    localBackFbo = fb.backFbo;
+                    localFinalBackFbo = fb.finalBackFbo;
                 }
 
                 // Validate instance
-                if (!inst || !inst->fboBack || !inst->fboTextureBack) continue;
+                if (!inst || !inst->fboTextureBack || !inst->finalTextureBack || localBackFbo == 0 || localFinalBackFbo == 0) continue;
 
                 // Skip if previous capture not yet consumed
                 if (inst->captureReady.load(std::memory_order_acquire)) continue;
@@ -1266,7 +1549,10 @@ static void MirrorCaptureThreadFunc(void* unused) {
                 // stale config value overwrites the GUI's immediate update.
 
                 // Render the mirror
-                RenderMirrorToBackBuffer(inst, conf, validTexture, captureVAO, captureVBO, gameW, gameH);
+                debugSamplePixel(conf, validTexture, gameW, gameH);
+
+                RenderMirrorToBackBuffer(inst, conf, validTexture, captureVAO, captureVBO, localBackFbo, localFinalBackFbo, gammaMode, gameW,
+                                         gameH);
 
                 // Pre-compute render cache for the render thread
                 // Read current screen geometry from atomics
@@ -1341,6 +1627,15 @@ static void MirrorCaptureThreadFunc(void* unused) {
         // Cleanup local shader programs (created on this thread's context)
         MT_CleanupShaders();
 
+        if (debugSampleFbo) { glDeleteFramebuffers(1, &debugSampleFbo); }
+
+        // Cleanup mirror-thread local FBOs
+        for (auto& kv : mt_fbos) {
+            if (kv.second.backFbo) { glDeleteFramebuffers(1, &kv.second.backFbo); }
+            if (kv.second.finalBackFbo) { glDeleteFramebuffers(1, &kv.second.finalBackFbo); }
+        }
+        mt_fbos.clear();
+
         // Cleanup shared capture textures (requires GL context current)
         CleanupCaptureTexture();
 
@@ -1383,7 +1678,7 @@ void StartMirrorCaptureThread(void* gameGLContext) {
 
     // Check if pre-shared context is available (from InitializeSharedContexts)
     HGLRC sharedContext = GetSharedMirrorContext();
-    HDC sharedDC = GetSharedContextDC();
+    HDC sharedDC = GetSharedMirrorContextDC();
 
     if (sharedContext && sharedDC) {
         // Use the pre-shared context (GPU sharing enabled for all threads)

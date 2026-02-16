@@ -158,6 +158,10 @@ void UpdateMirrorInputRegions(const std::string& mirrorName, const std::vector<M
 void UpdateMirrorCaptureSettings(const std::string& mirrorName, int captureWidth, int captureHeight, const MirrorBorderConfig& border,
                                  const MirrorColors& colors, float colorSensitivity, bool rawOutput, bool colorPassthrough);
 
+// Global mirror match colorspace (applies to all mirrors)
+void SetGlobalMirrorGammaMode(MirrorGammaMode mode);
+MirrorGammaMode GetGlobalMirrorGammaMode();
+
 void InitCaptureTexture(int width, int height);
 void CleanupCaptureTexture();
 

@@ -108,6 +108,14 @@ struct MirrorColors {
     Color output, border;
 };
 
+// How to interpret the captured game texture for color matching.
+// This only affects the filter/matching step (not raw output blit).
+enum class MirrorGammaMode {
+    Auto = 0,       // Auto-detect (best effort) based on framebuffer/texture encoding
+    AssumeSRGB = 1, // Treat captured input as sRGB and linearize for distance comparisons
+    AssumeLinear = 2 // Treat captured input as already linear
+};
+
 // Border type: dynamic (shader-based around content) or static (shape overlay)
 enum class MirrorBorderType {
     Dynamic, // Existing shader-based border around content pixels
@@ -436,6 +444,8 @@ struct Config {
     std::string fontPath = "c:\\Windows\\Fonts\\Arial.ttf"; // Custom font path for ImGui
     int fpsLimit = 0;                                       // FPS limit (0 = unlimited, 1-1000 = target FPS)
     int fpsLimitSleepThreshold = 1000;                      // Microseconds threshold for using timer sleep during high FPS
+    // Global mirror color-matching colorspace/gamma mode (applies to all mirrors)
+    MirrorGammaMode mirrorGammaMode = MirrorGammaMode::Auto;
     bool allowCursorEscape = false;                         // Allow cursor to escape window boundaries
     float mouseSensitivity = 1.0f;                          // Mouse sensitivity multiplier (1.0 = normal)
     int windowsMouseSpeed = 0;                              // Windows mouse speed override (0 = disabled, 1-20 = override)

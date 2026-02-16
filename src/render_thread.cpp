@@ -3687,7 +3687,7 @@ void StartRenderThread(void* gameGLContext) {
 
     // Check if pre-shared context is available (from InitializeSharedContexts)
     HGLRC sharedContext = GetSharedRenderContext();
-    HDC sharedDC = GetSharedContextDC();
+    HDC sharedDC = GetSharedRenderContextDC();
 
     if (sharedContext && sharedDC) {
         // Use the pre-shared context (GPU sharing enabled for all threads)

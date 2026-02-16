@@ -1981,6 +1981,9 @@ void LoadConfig() {
         // Publish initial config snapshot for reader threads (RCU pattern)
         PublishConfigSnapshot();
 
+        // Initialize mirror thread global colorspace mode from loaded config
+        SetGlobalMirrorGammaMode(g_config.mirrorGammaMode);
+
         // Mark config as successfully loaded (must be last line in try block)
         extern std::atomic<bool> g_configLoaded;
         g_configLoaded = true;
