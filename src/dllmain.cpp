@@ -1364,7 +1364,7 @@ BOOL WINAPI hkwglSwapBuffers(HDC hDc) {
                 // (InitializeGPUResources runs after this early-return path).
                 // Also uses modern GL (shaders + VAO) because Minecraft 1.17+ uses core profile
                 // where fixed-function (glBegin/glEnd) doesn't work.
-                if (g_welcomeToastVisible.load() && !frameCfg.disableConfigurePrompt && windowWidth > 0 && windowHeight > 0) {
+                if (g_welcomeToastVisible.load() /*&& !frameCfg.disableConfigurePrompt*/ && windowWidth > 0 && windowHeight > 0) {
                     // Self-contained GL resources (created lazily, persisted)
                     static GLuint s_wt_program = 0;
                     static GLuint s_wt_vao = 0, s_wt_vbo = 0;
@@ -1372,6 +1372,23 @@ BOOL WINAPI hkwglSwapBuffers(HDC hDc) {
                     static GLuint s_wt_texture = 0;
                     static int s_wt_texW = 0, s_wt_texH = 0;
                     static bool s_wt_initialized = false;
+                    static HGLRC s_wt_lastContext = NULL;
+
+                    // Fullscreen toggles can recreate the game's OpenGL context.
+                    // These GL object IDs are context-specific, so force a re-init when HGLRC changes.
+                    HGLRC s_wt_currentContext = wglGetCurrentContext();
+                    if (s_wt_currentContext != s_wt_lastContext) {
+                        s_wt_lastContext = s_wt_currentContext;
+                        s_wt_initialized = false;
+                        s_wt_program = 0;
+                        s_wt_vao = 0;
+                        s_wt_vbo = 0;
+                        s_wt_locTexture = -1;
+                        s_wt_locOpacity = -1;
+                        s_wt_texture = 0;
+                        s_wt_texW = 0;
+                        s_wt_texH = 0;
+                    }
 
                     if (!s_wt_initialized) {
                         s_wt_initialized = true;
@@ -1436,10 +1453,14 @@ void main() {
                                     if (pixels) {
                                         glGenTextures(1, &s_wt_texture);
                                         glBindTexture(GL_TEXTURE_2D, s_wt_texture);
-                                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                                        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                                        glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+                                        glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+                                        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
                                         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
                                         glBindTexture(GL_TEXTURE_2D, 0);
                                         s_wt_texW = w;
@@ -1458,6 +1479,10 @@ void main() {
                         GLint savedBlendSrcRGB, savedBlendDstRGB, savedBlendSrcA, savedBlendDstA;
                         GLint savedViewport[4];
                         GLboolean savedColorMask[4];
+                        GLint savedUnpackRowLength = 0;
+                        GLint savedUnpackSkipPixels = 0;
+                        GLint savedUnpackSkipRows = 0;
+                        GLint savedUnpackAlignment = 0;
 
                         glGetIntegerv(GL_CURRENT_PROGRAM, &savedProgram);
                         glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &savedVAO);
@@ -1476,6 +1501,11 @@ void main() {
                         glGetIntegerv(GL_BLEND_DST_ALPHA, &savedBlendDstA);
                         glGetIntegerv(GL_VIEWPORT, savedViewport);
                         glGetBooleanv(GL_COLOR_WRITEMASK, savedColorMask);
+
+                        glGetIntegerv(GL_UNPACK_ROW_LENGTH, &savedUnpackRowLength);
+                        glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &savedUnpackSkipPixels);
+                        glGetIntegerv(GL_UNPACK_SKIP_ROWS, &savedUnpackSkipRows);
+                        glGetIntegerv(GL_UNPACK_ALIGNMENT, &savedUnpackAlignment);
 
                         // Setup state
                         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1497,6 +1527,14 @@ void main() {
                         glActiveTexture(GL_TEXTURE0);
                         glBindTexture(GL_TEXTURE_2D, s_wt_texture);
                         glUniform1f(s_wt_locOpacity, 1.0f);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                        glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+                        glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+                        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 
                         // Scale toast image based on window size (baseline 1080p)
                         float scaleFactor = (static_cast<float>(windowHeight) / 1080.0f) * 0.45f;
@@ -1516,53 +1554,49 @@ void main() {
                                         cursorClient.x >= 0 && cursorClient.y >= 0 && cursorClient.x < drawW && cursorClient.y < drawH;
 
                                     if (clickedToast) {
-                                        // Use the monitor nearest the window so multi-monitor setups behave correctly.
-                                        // This also helps avoid certain games interpreting a (0,0, screenW, screenH)
-                                        // move as a "true" fullscreen transition.
-                                        RECT targetRect{ 0, 0, GetCachedScreenWidth(), GetCachedScreenHeight() };
-                                        HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                                        if (mon) {
-                                            MONITORINFO mi{};
-                                            mi.cbSize = sizeof(mi);
-                                            if (GetMonitorInfo(mon, &mi)) { targetRect = mi.rcMonitor; }
+                                        // Always target the PRIMARY monitor.
+                                        // Use rcWork (not rcMonitor) so this behaves like a normal window (taskbar visible),
+                                        // which also helps avoid driver "fullscreen" heuristics.
+                                        RECT targetRect{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+                                        {
+                                            const POINT primaryPt{ 0, 0 };
+                                            HMONITOR mon = MonitorFromPoint(primaryPt, MONITOR_DEFAULTTOPRIMARY);
+                                            if (mon) {
+                                                MONITORINFO mi{};
+                                                mi.cbSize = sizeof(mi);
+                                                if (GetMonitorInfo(mon, &mi)) { targetRect = mi.rcWork; }
+                                            }
                                         }
                                         const int targetW = (targetRect.right - targetRect.left);
                                         const int targetH = (targetRect.bottom - targetRect.top);
 
-                                        if (IsIconic(hwnd)) {
-                                            WINDOWPLACEMENT wp{};
-                                            wp.length = sizeof(wp);
-                                            if (GetWindowPlacement(hwnd, &wp)) {
-                                                switch (wp.showCmd) {
-                                                case SW_SHOWMAXIMIZED:
-                                                    ShowWindow(hwnd, SW_SHOWMAXIMIZED);
-                                                    break;
-                                                case SW_SHOWMINIMIZED:
-                                                    ShowWindow(hwnd, SW_RESTORE);
-                                                    break;
-                                                default:
-                                                    ShowWindow(hwnd, SW_NORMAL);
-                                                    break;
-                                                }
-                                            } else {
-                                                ShowWindow(hwnd, SW_RESTORE);
-                                            }
+                                        if (IsIconic(hwnd) || IsZoomed(hwnd)) {
+                                            // Ensure we're in a normal (restored) state before resizing/restyling.
+                                            ShowWindow(hwnd, SW_RESTORE);
                                         }
 
                                         {
+                                            // Keep this as a "window" (avoid WS_POPUP / WS_EX_TOPMOST) so the GPU driver
+                                            // doesn't treat it like exclusive/fullscreen, while still removing decorations.
                                             DWORD style = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE));
-                                            constexpr DWORD kBorderlessStyleMask =
-                                                ~(WS_BORDER | WS_DLGFRAME | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
-                                            style &= kBorderlessStyleMask;
+                                            style &= ~(WS_POPUP | WS_CAPTION | WS_BORDER | WS_DLGFRAME | WS_THICKFRAME | WS_MINIMIZEBOX |
+                                                       WS_MAXIMIZEBOX | WS_SYSMENU);
+                                            style |= WS_OVERLAPPED;
                                             SetWindowLongPtr(hwnd, GWL_STYLE, static_cast<LONG_PTR>(style));
+
+                                            DWORD exStyle = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_EXSTYLE));
+                                            exStyle &= ~(WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
+                                            exStyle |= WS_EX_APPWINDOW;
+                                            SetWindowLongPtr(hwnd, GWL_EXSTYLE, static_cast<LONG_PTR>(exStyle));
                                         }
 
-                                        MoveWindow(hwnd, targetRect.left, targetRect.top, targetW, targetH, TRUE);
+                                        SetWindowPos(hwnd, HWND_NOTOPMOST, targetRect.left, targetRect.top, targetW, targetH,
+                                                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
                                         g_cachedGameTextureId.store(UINT_MAX);
 
-                                        Log("[TOAST] toast1 clicked - switched to borderless fullscreen " + std::to_string(targetW) + "x" +
-                                            std::to_string(targetH) + " at (" + std::to_string(targetRect.left) + "," +
-                                            std::to_string(targetRect.top) + ")");
+                                        Log("[TOAST] toast1 clicked - switched to borderless-windowed (primary monitor work area) " +
+                                            std::to_string(targetW) + "x" + std::to_string(targetH) + " at (" +
+                                            std::to_string(targetRect.left) + "," + std::to_string(targetRect.top) + ")");
                                     }
                                 }
                             }
@@ -1608,6 +1642,11 @@ void main() {
                         else
                             glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
                         glColorMask(savedColorMask[0], savedColorMask[1], savedColorMask[2], savedColorMask[3]);
+
+                        glPixelStorei(GL_UNPACK_ROW_LENGTH, savedUnpackRowLength);
+                        glPixelStorei(GL_UNPACK_SKIP_PIXELS, savedUnpackSkipPixels);
+                        glPixelStorei(GL_UNPACK_SKIP_ROWS, savedUnpackSkipRows);
+                        glPixelStorei(GL_UNPACK_ALIGNMENT, savedUnpackAlignment);
 
                         if (savedBlend)
                             glEnable(GL_BLEND);

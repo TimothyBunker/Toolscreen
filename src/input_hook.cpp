@@ -313,6 +313,10 @@ InputHandlerResult HandleGuiToggle(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
         g_guiNeedsRecenter = true;
         ClipCursor(NULL);
 
+        // Dismiss the welcome/configure prompt for THIS SESSION once the user opens the GUI.
+        // (Fullscreen toggles can recreate GL contexts; prompt visibility must not depend on those.)
+        g_welcomeToastVisible.store(false, std::memory_order_release);
+
         // Touch "has_opened" flag file to preserve existing first-open marker behavior
         if (!g_toolscreenPath.empty()) {
             std::wstring flagPath = g_toolscreenPath + L"\\has_opened";

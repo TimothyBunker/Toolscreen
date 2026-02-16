@@ -39,14 +39,14 @@ if (ImGui::BeginTabItem("Other")) {
     HelpMarker("When enabled, mode transitions appear instant on your screen,\n"
                "but OBS Game Capture will show the animations.");
 
-    if (ImGui::Checkbox("Disable Fullscreen Prompt", &g_config.disableFullscreenPrompt)) { g_configIsDirty = true; }
+/*    if (ImGui::Checkbox("Disable Fullscreen Prompt", &g_config.disableFullscreenPrompt)) { g_configIsDirty = true; }
     ImGui::SameLine();
     HelpMarker("Disables the fullscreen toast prompt (toast2).\n"
                "When disabled, toast2 appears in fullscreen and fades out after 3 seconds.");
 
     if (ImGui::Checkbox("Disable Configure Prompt", &g_config.disableConfigurePrompt)) { g_configIsDirty = true; }
     ImGui::SameLine();
-    HelpMarker("Disables the configure toast prompt (toast1) shown in windowed mode.");
+    HelpMarker("Disables the configure toast prompt (toast1) shown in windowed mode.");*/
 
     // --- FONT SETTINGS ---
     ImGui::SeparatorText("Font");

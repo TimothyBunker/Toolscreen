@@ -2691,34 +2691,30 @@ void RenderWelcomeToast(bool isFullscreen) {
     //if (!isFullscreen && g_config.disableFullscreenPrompt) return;
     //if (isFullscreen && g_config.disableConfigurePrompt) return;
 
-    // Fullscreen toast (toast2) fades out after 3 seconds in fullscreen.
-    // Windowed toast (toast1) remains visible.
-    static bool s_wasFullscreenLastFrame = false;
-    static std::chrono::steady_clock::time_point s_fullscreenEnterTime;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (isFullscreen && !s_wasFullscreenLastFrame) { s_fullscreenEnterTime = now; }
-    s_wasFullscreenLastFrame = isFullscreen;
-
+    // IMPORTANT: This prompt should only stop showing when the user opens the GUI (Ctrl+I)
+    // for the current session. Fullscreen toggles can recreate the OpenGL context, so we
+    // must be able to recreate our GL resources when the HGLRC changes.
     float toastOpacity = 1.0f;
-    if (isFullscreen) {
-        constexpr float kHoldSeconds = 3.0f;
-        constexpr float kFadeSeconds = 0.6f;
-        const float elapsedSeconds = std::chrono::duration<float>(now - s_fullscreenEnterTime).count();
-        if (elapsedSeconds > kHoldSeconds) {
-            const float fadeT = (elapsedSeconds - kHoldSeconds) / kFadeSeconds;
-            if (fadeT >= 1.0f) return;
-            const float fadedOpacity = 1.0f - fadeT;
-            toastOpacity = (fadedOpacity < 0.0f) ? 0.0f : fadedOpacity;
-        }
-    }
 
-    // Static texture state - loaded once from embedded resources
+    // Static texture state - loaded once per OpenGL context from embedded resources
     static GLuint s_toast1Texture = 0;
     static GLuint s_toast2Texture = 0;
     static int s_toast1Width = 0, s_toast1Height = 0;
     static int s_toast2Width = 0, s_toast2Height = 0;
     static bool s_texturesLoaded = false;
+
+    // Fullscreen toggles (and some driver events) can recreate the OpenGL context.
+    // Texture object IDs are context-specific, so reload when the current HGLRC changes.
+    static HGLRC s_lastToastContext = NULL;
+    HGLRC currentCtx = wglGetCurrentContext();
+    if (currentCtx != s_lastToastContext) {
+        s_lastToastContext = currentCtx;
+        s_texturesLoaded = false;
+        s_toast1Texture = 0;
+        s_toast2Texture = 0;
+        s_toast1Width = s_toast1Height = 0;
+        s_toast2Width = s_toast2Height = 0;
+    }
 
     if (!s_texturesLoaded) {
         s_texturesLoaded = true;
