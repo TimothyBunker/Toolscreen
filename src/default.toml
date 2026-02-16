@@ -226,7 +226,7 @@ captureHeight = 7
 captureWidth = 11
 colorPassthrough = true
 colorSensitivity = 0.001
-colors = { border = [ 51, 88, 48 ], output = [ 0, 0, 0 ], targetColors = [ [ 69, 204, 101 ] ] }
+colors = { border = [ 51, 88, 48 ], output = [ 0, 0, 0 ], targetColors = [ [ 69, 204, 101 ], [ 69, 203, 101 ] ] }
 fps = 30
 input = [
     { relativeTo = 'pieLeft', x = 0, y = 0 },
