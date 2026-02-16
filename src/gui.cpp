@@ -2688,8 +2688,8 @@ void RenderWelcomeToast(bool isFullscreen) {
     if (!g_welcomeToastVisible.load()) return;
 
     // Per-toast visibility toggles from config
-    if (isFullscreen && g_config.disableFullscreenPrompt) return;
-    if (!isFullscreen && g_config.disableConfigurePrompt) return;
+    if (!isFullscreen && g_config.disableFullscreenPrompt) return;
+    if (isFullscreen && g_config.disableConfigurePrompt) return;
 
     // Fullscreen toast (toast2) fades out after 3 seconds in fullscreen.
     // Windowed toast (toast1) remains visible.
