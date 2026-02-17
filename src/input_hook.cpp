@@ -918,6 +918,37 @@ static bool TryTranslateVkToChar(DWORD vkCode, bool shiftDown, WCHAR& outChar) {
     return false;
 }
 
+static bool RebindKeyMatchesInput(DWORD inputVkCode, DWORD configuredFromKey, bool isKeyDown) {
+    if (inputVkCode == configuredFromKey) return true;
+
+    auto matchesModifierFamily = [&](DWORD genericKey, DWORD leftKey, DWORD rightKey) {
+        const bool inputIsGeneric = (inputVkCode == genericKey);
+        const bool inputIsSpecific = (inputVkCode == leftKey || inputVkCode == rightKey);
+        const bool fromIsGeneric = (configuredFromKey == genericKey);
+        const bool fromIsSpecific = (configuredFromKey == leftKey || configuredFromKey == rightKey);
+
+        if (!(inputIsGeneric || inputIsSpecific) || !(fromIsGeneric || fromIsSpecific)) return false;
+
+        // Windows often reports generic modifier VKs in message wParam.
+        // For key-down, verify the configured specific side is actually down.
+        if (inputIsGeneric && fromIsSpecific) {
+            if (isKeyDown) return (GetAsyncKeyState(configuredFromKey) & 0x8000) != 0;
+            return true;
+        }
+
+        // If Windows reports specific side while config uses generic modifier, accept it.
+        if (inputIsSpecific && fromIsGeneric) return true;
+
+        return false;
+    };
+
+    if (matchesModifierFamily(VK_CONTROL, VK_LCONTROL, VK_RCONTROL)) return true;
+    if (matchesModifierFamily(VK_SHIFT, VK_LSHIFT, VK_RSHIFT)) return true;
+    if (matchesModifierFamily(VK_MENU, VK_LMENU, VK_RMENU)) return true;
+
+    return false;
+}
+
 InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     PROFILE_SCOPE("HandleKeyRebinding");
 
@@ -977,7 +1008,7 @@ InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
     for (size_t i = 0; i < rebindCfg->keyRebinds.rebinds.size(); ++i) {
         const auto& rebind = rebindCfg->keyRebinds.rebinds[i];
 
-        if (rebind.enabled && rebind.fromKey != 0 && rebind.toKey != 0 && vkCode == rebind.fromKey) {
+        if (rebind.enabled && rebind.fromKey != 0 && rebind.toKey != 0 && RebindKeyMatchesInput(vkCode, rebind.fromKey, isKeyDown)) {
             DWORD outputVK;
             UINT outputScanCode;
 
