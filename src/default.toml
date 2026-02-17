@@ -75,7 +75,7 @@ windowWidth = 384
 
 [keyRebinds]
 enabled = true
-rebinds = [ { fromKey = 164, toKey = 114, enabled = true, useCustomOutput = false, customOutputVK = 0, customOutputScanCode = 0 } ]
+rebinds = [ { fromKey = 18, toKey = 114, enabled = true, useCustomOutput = false, customOutputVK = 0, customOutputScanCode = 0 } ]
 
 [[windowOverlay]]
 name = 'Stronghold Arrow Overlay'
