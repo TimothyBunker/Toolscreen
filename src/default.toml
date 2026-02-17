@@ -13,7 +13,6 @@ disableConfigurePrompt = false
 keyRepeatDelay = 0
 keyRepeatStartDelay = 0
 mouseSensitivity = 1.0
-windowOverlay = []
 windowsMouseSpeed = 0
 
 [cursors]
@@ -75,8 +74,33 @@ windowHeight = 16384
 windowWidth = 384
 
 [keyRebinds]
-enabled = false
-rebinds = []
+enabled = true
+rebinds = [ { fromKey = 164, toKey = 114, enabled = true, useCustomOutput = false, customOutputVK = 0, customOutputScanCode = 0 } ]
+
+[[windowOverlay]]
+name = 'Stronghold Arrow Overlay'
+windowTitle = 'Stronghold Arrow Overlay'
+windowClass = ''
+executableName = ''
+windowMatchPriority = 'title'
+x = 0
+y = 0
+scale = 1.0
+relativeTo = 'topLeftScreen'
+crop_top = 0
+crop_bottom = 0
+crop_left = 0
+crop_right = 0
+enableColorKey = true
+colorKeys = [ { color = [ 0, 255, 0 ], sensitivity = 0.05 } ]
+opacity = 1.0
+background = { enabled = false, color = [ 0, 0, 0 ], opacity = 0.0 }
+pixelatedScaling = false
+onlyOnMyScreen = false
+fps = 30
+captureMethod = 'Windows 10+'
+enableInteraction = false
+border = { enabled = false, color = [ 255, 255, 255 ], width = 4, radius = 0 }
 
 [[hotkey]]
 altSecondaryModes = []
@@ -105,7 +129,7 @@ triggerOnRelease = false
 [[hotkey]]
 altSecondaryModes = []
 debounce = 100
-keys = [ 164 ]
+keys = [ 75 ]
 mainMode = 'Fullscreen'
 secondaryMode = 'Wide'
 triggerOnRelease = false
@@ -301,7 +325,7 @@ sensitivityOverrideEnabled = false
 separateXYSensitivity = false
 stretch = { enabled = true, height = 1440, width = 2560, x = 0, y = 0 }
 width = 2560
-windowOverlayIds = []
+windowOverlayIds = [ 'Stronghold Arrow Overlay' ]
 
     [mode.transition]
     gameTransition = 'Bounce'
@@ -342,7 +366,7 @@ sensitivityOverrideEnabled = false
 separateXYSensitivity = false
 stretch = { enabled = false, height = 0, width = 0, x = 0, y = 0 }
 width = 384
-windowOverlayIds = []
+windowOverlayIds = [ 'Stronghold Arrow Overlay' ]
 
     [mode.transition]
     gameTransition = 'Bounce'
@@ -383,7 +407,7 @@ sensitivityOverrideEnabled = false
 separateXYSensitivity = false
 stretch = { enabled = false, height = 0, width = 0, x = 0, y = 0 }
 width = 'max(330, roundEven(screenWidth / 8))'
-windowOverlayIds = []
+windowOverlayIds = [ 'Stronghold Arrow Overlay' ]
 
     [mode.transition]
     gameTransition = 'Bounce'
@@ -424,7 +448,7 @@ sensitivityOverrideEnabled = false
 separateXYSensitivity = false
 stretch = { enabled = false, height = 0, width = 0, x = 0, y = 0 }
 width = "roundEven(screenWidth * 0.98)"
-windowOverlayIds = []
+windowOverlayIds = [ 'Stronghold Arrow Overlay' ]
 
     [mode.transition]
     gameTransition = 'Bounce'
