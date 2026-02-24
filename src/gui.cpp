@@ -5,6 +5,7 @@
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_win32.h"
 #include "imgui_stdlib.h"
+#include "input_hook.h"
 #include "logic_thread.h"
 #include "mirror_thread.h"
 #include "profiler.h"
@@ -27,7 +28,9 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <shellapi.h>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <windowsx.h>
@@ -1803,6 +1806,9 @@ void LoadConfig() {
 
         // Always enforce "Fullscreen" as the default mode, regardless of what's in the config file
         g_config.defaultMode = "Fullscreen";
+        // Custom branch behavior: keep startup Ctrl+I prompts disabled.
+        g_config.disableFullscreenPrompt = true;
+        g_config.disableConfigurePrompt = true;
 
         int screenWidth = GetCachedScreenWidth();
         int screenHeight = GetCachedScreenHeight();
@@ -2491,7 +2497,7 @@ void RenderSettingsGUI() {
     }
 
     // Create window title with version info
-    std::string windowTitle = "Toolscreen v" + GetToolscreenVersionString() + " by jojoe77777";
+    std::string windowTitle = "Toolscreen-GuckerOffficial-Edition v" + GetToolscreenVersionString();
 
     // Use a bool for the close button in the title bar
     bool windowOpen = true;
@@ -2525,29 +2531,111 @@ void RenderSettingsGUI() {
             s_isWindowOverlayDragging = false;
         }
 
-        // Screenshot button at top right (before everything else, so it's always in the same spot)
+        // Brand / credits row
         {
             static std::chrono::steady_clock::time_point s_lastScreenshotTime{};
-            auto now = std::chrono::steady_clock::now();
-            bool showCopied = std::chrono::duration_cast<std::chrono::seconds>(now - s_lastScreenshotTime).count() < 3;
+            auto OpenExternalUrl = [&](const char* url, const char* logLabel) {
+                HINSTANCE shellResult = ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
+                if ((INT_PTR)shellResult <= 32) { Log(std::string("ERROR: Failed to open ") + logLabel + " link."); }
+            };
+            auto DrawInlineLink = [&](const char* id, const char* label, const ImVec4& color, const char* tooltip, const char* url,
+                                      const char* logLabel) {
+                ImGui::PushID(id);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_Text, color);
+                bool clicked = ImGui::Button(label);
+                bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort);
+                if (hovered) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%s", tooltip);
+                }
+                ImDrawList* drawList = ImGui::GetWindowDrawList();
+                if (drawList) {
+                    const ImVec2 minPt = ImGui::GetItemRectMin();
+                    const ImVec2 maxPt = ImGui::GetItemRectMax();
+                    const ImU32 underline = ImGui::GetColorU32(
+                        hovered ? ImVec4(color.x, color.y, color.z, 1.0f) : ImVec4(color.x, color.y, color.z, 0.75f));
+                    drawList->AddLine(ImVec2(minPt.x, maxPt.y), ImVec2(maxPt.x, maxPt.y), underline, 1.0f);
+                }
+                ImGui::PopStyleColor(4);
+                ImGui::PopStyleVar();
+                ImGui::PopID();
+                if (clicked) OpenExternalUrl(url, logLabel);
+            };
+            auto DrawInlineScreenshotButton = [&]() {
+                const auto now = std::chrono::steady_clock::now();
+                const bool showCopied = std::chrono::duration_cast<std::chrono::seconds>(now - s_lastScreenshotTime).count() < 3;
+                const ImVec2 buttonSize(28.0f, 20.0f);
+                const bool clicked = ImGui::InvisibleButton("##screenshot_camera_button_inline", buttonSize);
+                const bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort);
+                if (hovered) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%s", showCopied ? "Screenshot real quick\nCopied!" : "Screenshot real quick");
+                }
+                if (clicked) {
+                    g_screenshotRequested = true;
+                    s_lastScreenshotTime = std::chrono::steady_clock::now();
+                }
 
-            const char* buttonLabel = showCopied ? "Copied!" : "Screenshot";
-            float buttonWidth = ImGui::CalcTextSize(buttonLabel).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+                ImDrawList* drawList = ImGui::GetWindowDrawList();
+                if (!drawList) return;
+                const ImVec2 bMin = ImGui::GetItemRectMin();
+                const ImVec2 bMax = ImGui::GetItemRectMax();
+                const ImU32 bgColor =
+                    showCopied ? IM_COL32(42, 96, 60, 220) : (hovered ? IM_COL32(52, 68, 92, 220) : IM_COL32(40, 52, 72, 205));
+                const ImU32 borderColor = showCopied ? IM_COL32(120, 214, 152, 240) : IM_COL32(116, 154, 194, 235);
+                drawList->AddRectFilled(bMin, bMax, bgColor, 5.0f);
+                drawList->AddRect(bMin, bMax, borderColor, 5.0f, 0, 1.2f);
 
-            // Save cursor position to restore after
-            ImVec2 savedCursor = ImGui::GetCursorPos();
+                const float camW = 13.0f;
+                const float camH = 8.0f;
+                const float camX = bMin.x + (buttonSize.x - camW) * 0.5f;
+                const float camY = bMin.y + (buttonSize.y - camH) * 0.5f + 0.5f;
+                const ImU32 camBody = IM_COL32(226, 236, 248, 245);
+                const ImU32 camLens = IM_COL32(42, 58, 76, 245);
+                const ImU32 camLensRing = IM_COL32(182, 208, 236, 245);
+                drawList->AddRectFilled(ImVec2(camX, camY), ImVec2(camX + camW, camY + camH), camBody, 1.8f);
+                drawList->AddRectFilled(ImVec2(camX + 2.4f, camY - 2.4f), ImVec2(camX + 6.0f, camY), camBody, 0.8f);
+                const ImVec2 lensCenter(camX + camW * 0.52f, camY + camH * 0.52f);
+                drawList->AddCircleFilled(lensCenter, 2.2f, camLens, 16);
+                drawList->AddCircle(lensCenter, 2.3f, camLensRing, 16, 1.0f);
 
-            // Position at top right, accounting for close button width (~25px) and some padding
-            ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - buttonWidth - ImGui::GetStyle().WindowPadding.x, 30.0f));
+                if (showCopied) {
+                    const ImU32 check = IM_COL32(120, 255, 166, 245);
+                    const ImVec2 c0(bMax.x - 8.0f, bMin.y + 6.0f);
+                    const ImVec2 c1(bMax.x - 5.6f, bMin.y + 8.3f);
+                    const ImVec2 c2(bMax.x - 2.4f, bMin.y + 4.3f);
+                    drawList->AddLine(c0, c1, check, 1.6f);
+                    drawList->AddLine(c1, c2, check, 1.6f);
+                }
+            };
 
-            if (ImGui::Button(buttonLabel)) {
-                g_screenshotRequested = true;
-                s_lastScreenshotTime = std::chrono::steady_clock::now();
-            }
+            ImGui::TextDisabled("Toolscreen-GuckerOffficial-Edition");
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::TextDisabled("Credit:");
+            ImGui::SameLine();
+            DrawInlineLink("credit_link", "jojoe77777", ImVec4(0.62f, 0.82f, 1.0f, 1.0f), "Open Toolscreen upstream project",
+                           "https://github.com/jojoe77777/Toolscreen", "Toolscreen upstream");
 
-            // Restore cursor position
-            ImGui::SetCursorPos(savedCursor);
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::TextDisabled("Twitch:");
+            ImGui::SameLine();
+            DrawInlineLink("twitch_link", "twitch.tv/guckerofficial", ImVec4(0.72f, 0.56f, 1.0f, 1.0f), "Open Twitch channel",
+                           "https://twitch.tv/guckerofficial", "Twitch");
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            DrawInlineScreenshotButton();
         }
+
+        ImGui::Separator();
 
         // --- BASIC/ADVANCED MODE TOGGLE ---
         {
@@ -2686,6 +2774,13 @@ std::atomic<bool> g_welcomeToastVisible{ false };
 std::atomic<bool> g_configurePromptDismissedThisSession{ false };
 
 void RenderWelcomeToast(bool isFullscreen) {
+    auto cfgSnap = GetConfigSnapshot();
+    if (cfgSnap) {
+        // Disable startup Ctrl+I toasts when the prompt toggles are enabled.
+        if (!isFullscreen && cfgSnap->disableConfigurePrompt) { return; }
+        if (isFullscreen && cfgSnap->disableFullscreenPrompt) { return; }
+    }
+
     // Semantics:
     // - toast1 (windowed fullscreenPrompt) should ALWAYS show in windowed mode.
     // - toast2 (fullscreen configurePrompt) should ALWAYS show in fullscreen UNTIL Ctrl+I is pressed for this session.
