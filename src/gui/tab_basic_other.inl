@@ -1,14 +1,14 @@
-if (ImGui::BeginTabItem("Other")) {
+if (ImGui::BeginTabItem("[O] Other")) {
     g_currentlyEditingMirror = "";
     g_imageDragMode.store(false);
     g_windowOverlayDragMode.store(false);
 
     // --- GUI HOTKEY SECTION ---
-    ImGui::SeparatorText("GUI Hotkey");
+    ImGui::SeparatorText("[G] GUI");
     ImGui::PushID("basic_gui_hotkey");
     std::string guiKeyStr = GetKeyComboString(g_config.guiHotkey);
 
-    ImGui::Text("Open/Close GUI:");
+    ImGui::Text("Toggle:");
     ImGui::SameLine();
 
     bool isBindingGui = (s_mainHotkeyToBind == -999);
@@ -21,7 +21,7 @@ if (ImGui::BeginTabItem("Other")) {
     ImGui::PopID();
 
     // --- DISPLAY SETTINGS ---
-    ImGui::SeparatorText("Display Settings");
+    ImGui::SeparatorText("[D] Display");
 
     ImGui::Text("FPS Limit:");
     ImGui::SetNextItemWidth(300);
@@ -34,7 +34,7 @@ if (ImGui::BeginTabItem("Other")) {
     HelpMarker("Limits the game's maximum frame rate.\n"
                "Lower FPS can reduce GPU load and power consumption.");
 
-    if (ImGui::Checkbox("Hide animations in game", &g_config.hideAnimationsInGame)) { g_configIsDirty = true; }
+    if (ImGui::Checkbox("Hide In-Game Animations", &g_config.hideAnimationsInGame)) { g_configIsDirty = true; }
     ImGui::SameLine();
     HelpMarker("When enabled, mode transitions appear instant on your screen,\n"
                "but OBS Game Capture will show the animations.");
@@ -49,9 +49,9 @@ if (ImGui::BeginTabItem("Other")) {
     HelpMarker("Disables the configure toast prompt (toast1) shown in windowed mode.");*/
 
     // --- FONT SETTINGS ---
-    ImGui::SeparatorText("Font");
+    ImGui::SeparatorText("[F] Font");
 
-    ImGui::Text("Font Path:");
+    ImGui::Text("Path:");
     ImGui::SetNextItemWidth(300);
     if (ImGui::InputText("##FontPath", &g_config.fontPath)) { g_configIsDirty = true; }
     ImGui::SameLine();

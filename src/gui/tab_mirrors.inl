@@ -1,4 +1,4 @@
-if (ImGui::BeginTabItem("Mirrors")) {
+if (ImGui::BeginTabItem("[R] Mirrors")) {
     g_currentlyEditingMirror = ""; // Disable image drag mode in other tabs
     g_imageDragMode.store(false);
     g_windowOverlayDragMode.store(false);

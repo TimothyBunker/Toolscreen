@@ -10,13 +10,17 @@
 #include "utils.h"
 #include "virtual_camera.h"
 #include "window_overlay.h"
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
 #include <set>
+#include <sstream>
 #include <thread>
 
 // ImGui includes for render thread
-#include "include/imgui/backends/imgui_impl_opengl3.h"
-#include "include/imgui/backends/imgui_impl_win32.h"
-#include "include/imgui/imgui.h"
+#include "imgui_impl_opengl3.h"
+#include "imgui_impl_win32.h"
+#include "imgui.h"
 
 // For GetCachedScreenHeight
 #include "logic_thread.h"
@@ -148,6 +152,67 @@ extern std::atomic<bool> g_hwndChanged;
 static ImGuiContext* g_renderThreadImGuiContext = nullptr;
 static bool g_renderThreadImGuiInitialized = false;
 
+struct RT_MonitorLookupContext {
+    HMONITOR target = nullptr;
+    int currentIndex = 0;
+    int foundIndex = -1;
+};
+
+static int RT_ExtractDisplayNumber(const WCHAR* deviceName) {
+    if (!deviceName) return -1;
+    const WCHAR* p = deviceName;
+    while (*p && (*p < L'0' || *p > L'9')) {
+        ++p;
+    }
+    if (!*p) return -1;
+
+    int value = 0;
+    while (*p >= L'0' && *p <= L'9') {
+        value = (value * 10) + static_cast<int>(*p - L'0');
+        ++p;
+    }
+    if (value < 1 || value > 63) return -1;
+    return value;
+}
+
+static BOOL CALLBACK RT_FindMonitorIndexEnumProc(HMONITOR monitor, HDC, LPRECT, LPARAM userData) {
+    auto* ctx = reinterpret_cast<RT_MonitorLookupContext*>(userData);
+    if (!ctx) return TRUE;
+    if (ctx->foundIndex < 0 && monitor == ctx->target) { ctx->foundIndex = ctx->currentIndex; }
+    ctx->currentIndex += 1;
+    return TRUE;
+}
+
+static int RT_GetCurrentGameMonitorMaskBit() {
+    HWND hwnd = g_minecraftHwnd.load();
+    HMONITOR monitor = MonitorFromWindow(hwnd ? hwnd : GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+    if (!monitor) return 0;
+
+    // Prefer Windows DISPLAYn identity so GUI monitor selection matches runtime routing.
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&mi))) {
+        const int displayNumber = RT_ExtractDisplayNumber(mi.szDevice);
+        if (displayNumber >= 1 && displayNumber <= 63) { return displayNumber - 1; }
+    }
+
+    // Fallback: enum ordinal if device name parsing fails.
+    RT_MonitorLookupContext ctx;
+    ctx.target = monitor;
+    EnumDisplayMonitors(nullptr, nullptr, RT_FindMonitorIndexEnumProc, reinterpret_cast<LPARAM>(&ctx));
+    return (ctx.foundIndex >= 0) ? ctx.foundIndex : 0;
+}
+
+static bool RT_ShouldRenderStrongholdOverlayOnCurrentMonitor(const StrongholdOverlayRenderSnapshot& snap) {
+    if (snap.renderMonitorMode != 1) return true; // All monitors
+    if (snap.renderMonitorMask == 0ull) return false;
+
+    const int monitorMaskBit = RT_GetCurrentGameMonitorMaskBit();
+    if (monitorMaskBit < 0 || monitorMaskBit >= 63) return true;
+    const unsigned long long bit = (1ull << monitorMaskBit);
+    return (snap.renderMonitorMask & bit) != 0ull;
+}
+
 // EyeZoom dedicated font
 std::atomic<bool> g_eyeZoomFontNeedsReload{ false };
 static ImFont* g_eyeZoomTextFont = nullptr;
@@ -218,6 +283,1129 @@ static bool RT_TryInitializeImGui(HWND hwnd, const Config& cfg) {
     g_renderThreadImGuiInitialized = true;
     LogCategory("init", "Render Thread: ImGui initialized successfully");
     return true;
+}
+
+static void DrawContinuousCompassArrow(ImDrawList* drawList, const ImVec2& center, float radius, float relativeYawDeg, ImU32 arrowColor,
+                                       ImU32 ringColor) {
+    if (!drawList || radius <= 1.0f) return;
+
+    constexpr float kPi = 3.14159265358979323846f;
+    const float angleRad = relativeYawDeg * (kPi / 180.0f);
+    const ImVec2 dir(std::sin(angleRad), -std::cos(angleRad));
+    const ImVec2 perp(-dir.y, dir.x);
+
+    const float tipDist = radius * 0.90f;
+    const float tailDist = radius * 0.45f;
+    const float headLen = radius * 0.38f;
+    const float headHalfWidth = radius * 0.24f;
+    const float shaftThickness = std::max(1.5f, radius * 0.13f);
+
+    const ImVec2 tip(center.x + dir.x * tipDist, center.y + dir.y * tipDist);
+    const ImVec2 tail(center.x - dir.x * tailDist, center.y - dir.y * tailDist);
+    const ImVec2 headBase(tip.x - dir.x * headLen, tip.y - dir.y * headLen);
+    const ImVec2 headLeft(headBase.x + perp.x * headHalfWidth, headBase.y + perp.y * headHalfWidth);
+    const ImVec2 headRight(headBase.x - perp.x * headHalfWidth, headBase.y - perp.y * headHalfWidth);
+
+    drawList->AddCircle(center, radius, ringColor, 48, std::max(1.0f, radius * 0.06f));
+    drawList->AddLine(tail, headBase, arrowColor, shaftThickness);
+    drawList->AddTriangleFilled(tip, headLeft, headRight, arrowColor);
+    drawList->AddCircleFilled(center, std::max(1.5f, radius * 0.10f), arrowColor);
+}
+
+static ImU32 RT_ScaleColor(ImU32 color, float factor) {
+    const int r = static_cast<int>((color >> IM_COL32_R_SHIFT) & 0xFF);
+    const int g = static_cast<int>((color >> IM_COL32_G_SHIFT) & 0xFF);
+    const int b = static_cast<int>((color >> IM_COL32_B_SHIFT) & 0xFF);
+    const int a = static_cast<int>((color >> IM_COL32_A_SHIFT) & 0xFF);
+    const int sr = std::clamp(static_cast<int>(std::lround(static_cast<float>(r) * factor)), 0, 255);
+    const int sg = std::clamp(static_cast<int>(std::lround(static_cast<float>(g) * factor)), 0, 255);
+    const int sb = std::clamp(static_cast<int>(std::lround(static_cast<float>(b) * factor)), 0, 255);
+    return IM_COL32(sr, sg, sb, a);
+}
+
+static ImU32 RT_LerpColor(ImU32 from, ImU32 to, float t) {
+    const float clampedT = std::clamp(t, 0.0f, 1.0f);
+    const int fr = static_cast<int>((from >> IM_COL32_R_SHIFT) & 0xFF);
+    const int fg = static_cast<int>((from >> IM_COL32_G_SHIFT) & 0xFF);
+    const int fb = static_cast<int>((from >> IM_COL32_B_SHIFT) & 0xFF);
+    const int fa = static_cast<int>((from >> IM_COL32_A_SHIFT) & 0xFF);
+    const int tr = static_cast<int>((to >> IM_COL32_R_SHIFT) & 0xFF);
+    const int tg = static_cast<int>((to >> IM_COL32_G_SHIFT) & 0xFF);
+    const int tb = static_cast<int>((to >> IM_COL32_B_SHIFT) & 0xFF);
+    const int ta = static_cast<int>((to >> IM_COL32_A_SHIFT) & 0xFF);
+    const int rr = static_cast<int>(std::lround(fr + (tr - fr) * clampedT));
+    const int rg = static_cast<int>(std::lround(fg + (tg - fg) * clampedT));
+    const int rb = static_cast<int>(std::lround(fb + (tb - fb) * clampedT));
+    const int ra = static_cast<int>(std::lround(fa + (ta - fa) * clampedT));
+    return IM_COL32(rr, rg, rb, ra);
+}
+
+static ImU32 RT_CertaintyHeatColor(float certaintyPercent, int alpha) {
+    const float t = std::clamp(certaintyPercent / 100.0f, 0.0f, 1.0f);
+    float r = 255.0f;
+    float g = 96.0f;
+    float b = 96.0f;
+    if (t < 0.5f) {
+        const float u = t / 0.5f;
+        g = 96.0f + (159.0f * u);
+        b = 96.0f;
+    } else {
+        const float u = (t - 0.5f) / 0.5f;
+        r = 255.0f - (159.0f * u);
+        g = 255.0f;
+        b = 96.0f;
+    }
+    return IM_COL32(static_cast<int>(std::lround(r)), static_cast<int>(std::lround(g)), static_cast<int>(std::lround(b)),
+                    std::clamp(alpha, 0, 255));
+}
+
+static void DrawBoatIconImGui(ImDrawList* drawList, const ImVec2& center, float size, ImU32 boatColor, ImU32 strokeColor) {
+    if (!drawList || size <= 2.0f) return;
+
+    constexpr int kBoatSpriteW = 28;
+    constexpr int kBoatSpriteH = 18;
+    static const char* kBoatSprite[kBoatSpriteH] = {
+        "................ooooo.......", "..........ooo.oo32234oo.....", ".........o423o321122334oo...",
+        "........o3222211112223334ooo", "...o..oo3221111112222222334o", "..o1oo432111111234433323432o",
+        "oo1133211111123443334443211o", "o11342111112444434344321111o", ".o1234422344433344432111111o",
+        "..o2233444433344433211111oo.", "...o2223344444431133111oo...", "...o22222333231111231oo.....",
+        "....oo22222222111123o.......", "......oo222222111oo3o.......", "........oo22111oo..oo.......",
+        "..........ooooo....o3o......", "....................oo......", "....................oo......",
+    };
+
+    const ImU32 shade1 = RT_ScaleColor(boatColor, 0.62f);
+    const ImU32 shade2 = RT_ScaleColor(boatColor, 0.80f);
+    const ImU32 shade3 = RT_ScaleColor(boatColor, 0.98f);
+    const ImU32 shade4 = RT_ScaleColor(boatColor, 1.14f);
+    const ImU32 outlineColor = RT_LerpColor(RT_ScaleColor(boatColor, 0.40f), strokeColor, 0.08f);
+    const float px = std::max(1.0f, size / static_cast<float>(kBoatSpriteH));
+    const float spriteW = px * static_cast<float>(kBoatSpriteW);
+    const float spriteH = px * static_cast<float>(kBoatSpriteH);
+    const ImVec2 topLeft(center.x - spriteW * 0.5f, center.y - spriteH * 0.5f);
+
+    for (int y = 0; y < kBoatSpriteH; ++y) {
+        for (int x = 0; x < kBoatSpriteW; ++x) {
+            const char p = kBoatSprite[y][x];
+            if (p == '.') continue;
+            ImU32 fill = shade2;
+            if (p == 'o') fill = outlineColor;
+            else if (p == '1') fill = shade1;
+            else if (p == '2') fill = shade2;
+            else if (p == '3') fill = shade3;
+            else if (p == '4') fill = shade4;
+            const ImVec2 minPt(topLeft.x + x * px, topLeft.y + y * px);
+            const ImVec2 maxPt(minPt.x + px, minPt.y + px);
+            drawList->AddRectFilled(minPt, maxPt, fill);
+        }
+    }
+}
+
+static void DrawEnderEyeIconImGui(ImDrawList* drawList, const ImVec2& center, float size, float certaintyPercent, ImU32 strokeColor) {
+    if (!drawList || size <= 2.0f) return;
+
+    constexpr int kEyeSpriteW = 16;
+    constexpr int kEyeSpriteH = 16;
+    static const char* kEyeSprite[kEyeSpriteH] = {
+        "......oooo......", "....oo2222oo....", "..oo23333332oo..", "..o2233333321o..", ".o223444443322o.",
+        ".o334441124333o.", "o23344111124332o", "o24444111124332o", "o24444111124332o", "o23342111144442o",
+        ".o223441144233o.", ".o222342242422o.", "..o1222222321o..", "..oo22222232oo..", "....oo2222oo....",
+        "......oooo......",
+    };
+
+    const int alpha = static_cast<int>((strokeColor >> IM_COL32_A_SHIFT) & 0xFF);
+    const ImU32 certaintyColor = RT_CertaintyHeatColor(certaintyPercent, alpha);
+    const ImU32 outlineColor = RT_LerpColor(IM_COL32(26, 34, 42, alpha), certaintyColor, 0.20f);
+    const ImU32 c1 = RT_LerpColor(IM_COL32(10, 14, 20, alpha), certaintyColor, 0.20f);
+    const ImU32 c2 = RT_LerpColor(IM_COL32(36, 46, 58, alpha), certaintyColor, 0.46f);
+    const ImU32 c3 = RT_LerpColor(certaintyColor, IM_COL32(255, 255, 255, alpha), 0.12f);
+    const ImU32 c4 = RT_LerpColor(certaintyColor, IM_COL32(255, 255, 255, alpha), 0.34f);
+    const float px = std::max(1.0f, size / static_cast<float>(kEyeSpriteH));
+    const float spriteW = px * static_cast<float>(kEyeSpriteW);
+    const float spriteH = px * static_cast<float>(kEyeSpriteH);
+    const ImVec2 topLeft(center.x - spriteW * 0.5f, center.y - spriteH * 0.5f);
+
+    for (int y = 0; y < kEyeSpriteH; ++y) {
+        for (int x = 0; x < kEyeSpriteW; ++x) {
+            const char p = kEyeSprite[y][x];
+            if (p == '.') continue;
+            ImU32 fill = c3;
+            if (p == 'o') fill = outlineColor;
+            else if (p == '1') fill = c1;
+            else if (p == '2') fill = c2;
+            else if (p == '3') fill = c3;
+            else if (p == '4') fill = c4;
+            const ImVec2 minPt(topLeft.x + x * px, topLeft.y + y * px);
+            const ImVec2 maxPt(minPt.x + px, minPt.y + px);
+            drawList->AddRectFilled(minPt, maxPt, fill);
+        }
+    }
+}
+
+static void DrawStrongholdStatusIconImGui(ImDrawList* drawList, const ImVec2& center, float size, bool boatModeEnabled, int boatState,
+                                          bool hasCertainty, float certaintyPercent, ImU32 boatBlueColor, ImU32 boatGreenColor,
+                                          ImU32 boatRedColor, ImU32 strokeColor) {
+    if (!drawList || size <= 2.0f) return;
+    if (boatModeEnabled) {
+        ImU32 boatColor = boatBlueColor;
+        if (boatState == 1) {
+            boatColor = boatGreenColor;
+        } else if (boatState == 2) {
+            boatColor = boatRedColor;
+        }
+        DrawBoatIconImGui(drawList, center, size, boatColor, strokeColor);
+        return;
+    }
+
+    const float certainty = hasCertainty ? std::clamp(certaintyPercent, 0.0f, 100.0f) : 0.0f;
+    DrawEnderEyeIconImGui(drawList, center, size, certainty, strokeColor);
+}
+
+static void DrawLockBadgeImGui(ImDrawList* drawList, const ImVec2& topLeft, float size, bool locked, ImU32 fillColor, ImU32 strokeColor) {
+    if (!drawList || size <= 2.0f) return;
+
+    const float bodyW = size * 0.74f;
+    const float bodyH = size * 0.52f;
+    const float bodyX = topLeft.x + (size - bodyW) * 0.5f;
+    const float bodyY = topLeft.y + size * 0.42f;
+    const float bodyRound = std::max(1.0f, size * 0.10f);
+    const float shackleR = std::max(2.0f, size * 0.25f);
+    const float shackleY = bodyY + size * 0.02f;
+    const float strokeW = std::max(1.0f, size * 0.08f);
+    const float leftX = bodyX + bodyW * 0.20f;
+    const float rightX = bodyX + bodyW * 0.80f;
+
+    const ImVec2 bodyMin(bodyX, bodyY);
+    const ImVec2 bodyMax(bodyX + bodyW, bodyY + bodyH);
+    drawList->AddRectFilled(bodyMin, bodyMax, fillColor, bodyRound);
+    drawList->AddRect(bodyMin, bodyMax, strokeColor, bodyRound, 0, strokeW);
+
+    constexpr float kPi = 3.14159265358979323846f;
+    drawList->PathArcTo(ImVec2((leftX + rightX) * 0.5f, shackleY), shackleR, kPi, 2.0f * kPi, 18);
+    drawList->PathStroke(strokeColor, false, strokeW);
+
+    if (locked) {
+        drawList->AddLine(ImVec2(leftX, shackleY), ImVec2(leftX, bodyY + strokeW), strokeColor, strokeW);
+        drawList->AddLine(ImVec2(rightX, shackleY), ImVec2(rightX, bodyY + strokeW), strokeColor, strokeW);
+    } else {
+        drawList->AddLine(ImVec2(leftX, shackleY), ImVec2(leftX, bodyY + strokeW), strokeColor, strokeW);
+        drawList->AddLine(ImVec2(rightX + size * 0.07f, shackleY + size * 0.10f), ImVec2(rightX + size * 0.10f, bodyY - size * 0.03f),
+                          strokeColor, strokeW);
+    }
+}
+
+static float DrawWorldBadgeImGui(ImDrawList* drawList, ImFont* font, const ImVec2& topLeft, float fontSize, char worldId, ImU32 fillColor,
+                                 ImU32 textColor, ImU32 borderColor) {
+    if (!drawList || !font || fontSize <= 1.0f) return 0.0f;
+
+    const float h = std::max(10.0f, fontSize * 1.02f);
+    const float w = h * 1.08f;
+    const float round = std::max(1.0f, h * 0.24f);
+    const ImVec2 badgeMin(topLeft.x, topLeft.y);
+    const ImVec2 badgeMax(topLeft.x + w, topLeft.y + h);
+    drawList->AddRectFilled(badgeMin, badgeMax, fillColor, round);
+    drawList->AddRect(badgeMin, badgeMax, borderColor, round, 0, std::max(1.0f, fontSize * 0.08f));
+
+    char label[2] = { worldId, '\0' };
+    const float badgeFontSize = fontSize * 0.86f;
+    const ImVec2 ts = font->CalcTextSizeA(badgeFontSize, FLT_MAX, 0.0f, label);
+    const ImVec2 textPos(topLeft.x + (w - ts.x) * 0.5f, topLeft.y + (h - ts.y) * 0.5f);
+    drawList->AddText(font, badgeFontSize, textPos, textColor, label);
+    return w;
+}
+
+static ImU32 NegativeAwareTextColor(const std::string& text, ImU32 normalColor, ImU32 negativeColor) {
+    return (!text.empty() && text[0] == '-') ? negativeColor : normalColor;
+}
+
+static std::string RT_TruncateSingleLine(std::string text, size_t maxLen) {
+    if (text.size() <= maxLen) return text;
+    if (maxLen <= 3) return text.substr(0, maxLen);
+    text.resize(maxLen - 3);
+    text += "...";
+    return text;
+}
+
+static void RT_RenderStrongholdOverlayImGuiCompact(const StrongholdOverlayRenderSnapshot& snap, bool drawBehindGui) {
+    if (!snap.enabled || !snap.visible) return;
+    if (!ImGui::GetCurrentContext()) return;
+
+    ImDrawList* drawList = drawBehindGui ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+    ImFont* font = ImGui::GetFont();
+    if (!drawList || !font) return;
+
+    const bool showEstimateValues = snap.showEstimateValues;
+    const float uiScale = std::clamp(snap.scale, 0.4f, 3.0f);
+    const float baseFontSize = ImGui::GetFontSize() * uiScale * 1.30f;
+    const float headerFontSize = baseFontSize * 1.24f;
+    const float rowFontSize = baseFontSize * 1.12f;
+    const float metaFontSize = baseFontSize * 1.02f;
+    const float lineAdvance = rowFontSize * 1.28f;
+    const float padX = 15.0f * uiScale;
+    const float padY = 10.0f * uiScale;
+    const float sectionGap = 7.0f * uiScale;
+
+    const int textAlpha = static_cast<int>(std::clamp(snap.overlayOpacity, 0.0f, 1.0f) * 255.0f);
+    const int bgAlpha = static_cast<int>(std::clamp(snap.overlayOpacity * snap.backgroundOpacity, 0.0f, 1.0f) * 255.0f);
+    const ImU32 bgColor = IM_COL32(7, 15, 24, bgAlpha);
+    const ImU32 borderColor = IM_COL32(155, 225, 190, textAlpha);
+    const ImU32 statusColor = snap.targetLocked ? IM_COL32(255, 235, 140, textAlpha) : IM_COL32(180, 255, 200, textAlpha);
+    const ImU32 lineColor = IM_COL32(242, 248, 255, textAlpha);
+    const ImU32 mutedColor = IM_COL32(196, 220, 236, textAlpha);
+    const ImU32 highlightColor = IM_COL32(255, 238, 145, textAlpha);
+    const ImU32 warningColor = IM_COL32(255, 150, 130, textAlpha);
+    const ImU32 boatBlueColor = IM_COL32(130, 185, 255, textAlpha);
+    const ImU32 boatGreenColor = IM_COL32(130, 255, 160, textAlpha);
+    const ImU32 boatRedColor = IM_COL32(255, 130, 130, textAlpha);
+    const ImU32 topAdjColor = IM_COL32(235, 246, 255, textAlpha);
+    const ImU32 topAdjPlusColor = IM_COL32(130, 255, 160, textAlpha);
+    const ImU32 topAdjMinusColor = IM_COL32(255, 130, 130, textAlpha);
+    const ImU32 axisDividerColor = IM_COL32(150, 168, 180, textAlpha);
+
+    auto formatSignedAdjustment = [](float value) {
+        std::ostringstream out;
+        out << std::showpos << std::fixed;
+        if (std::abs(value) < 0.1f) {
+            out << std::setprecision(3) << value;
+        } else {
+            out << std::setprecision(2) << value;
+        }
+        return out.str();
+    };
+    auto formatSignedInt = [](int value) {
+        std::ostringstream out;
+        out << std::showpos << value;
+        return out.str();
+    };
+    auto axisColorFromCloseness = [&](float closeness) {
+        const float t = std::clamp(closeness, 0.0f, 1.0f);
+        const int r = static_cast<int>(std::lround(255.0f - 178.0f * t));
+        const int g = static_cast<int>(std::lround(96.0f + 159.0f * t));
+        const int b = static_cast<int>(std::lround(118.0f + 28.0f * t));
+        return IM_COL32(r, g, b, textAlpha);
+    };
+    auto axisCloseness = [](int estimated, int target, int player) {
+        const int referenceAbs = std::abs(player - target);
+        const float denom = std::max(6.0f, static_cast<float>(referenceAbs));
+        return std::clamp(1.0f - (static_cast<float>(std::abs(estimated - target)) / denom), 0.0f, 1.0f);
+    };
+    auto axisPercent = [](float closeness) { return static_cast<int>(std::lround(std::clamp(closeness, 0.0f, 1.0f) * 100.0f)); };
+    auto distance2D = [](int ax, int az, int bx, int bz) {
+        const double dx = static_cast<double>(ax - bx);
+        const double dz = static_cast<double>(az - bz);
+        return static_cast<float>(std::sqrt((dx * dx) + (dz * dz)));
+    };
+    auto distanceCloseness = [](float distance, float maxDistance) {
+        return std::clamp(1.0f - (distance / std::max(1.0f, maxDistance)), 0.0f, 1.0f);
+    };
+
+    const float nXCloseness = axisCloseness(snap.estimatedNetherX, snap.targetNetherX, snap.playerNetherX);
+    const float nZCloseness = axisCloseness(snap.estimatedNetherZ, snap.targetNetherZ, snap.playerNetherZ);
+    const float oXCloseness = axisCloseness(snap.estimatedOverworldX, snap.targetOverworldX, snap.playerOverworldX);
+    const float oZCloseness = axisCloseness(snap.estimatedOverworldZ, snap.targetOverworldZ, snap.playerOverworldZ);
+    const int nXPct = axisPercent(nXCloseness);
+    const int nZPct = axisPercent(nZCloseness);
+    const int oXPct = axisPercent(oXCloseness);
+    const int oZPct = axisPercent(oZCloseness);
+
+    const int nDx = snap.estimatedNetherX - snap.targetNetherX;
+    const int nDz = snap.estimatedNetherZ - snap.targetNetherZ;
+    const int oDx = snap.estimatedOverworldX - snap.targetOverworldX;
+    const int oDz = snap.estimatedOverworldZ - snap.targetOverworldZ;
+    const float nDistToTarget = distance2D(snap.playerNetherX, snap.playerNetherZ, snap.targetNetherX, snap.targetNetherZ);
+    const float nErrDistance = distance2D(snap.estimatedNetherX, snap.estimatedNetherZ, snap.targetNetherX, snap.targetNetherZ);
+    const float oDistToTarget = distance2D(snap.playerOverworldX, snap.playerOverworldZ, snap.targetOverworldX, snap.targetOverworldZ);
+    const float oErrDistance = distance2D(snap.estimatedOverworldX, snap.estimatedOverworldZ, snap.targetOverworldX, snap.targetOverworldZ);
+    const float nDistCloseness = distanceCloseness(nDistToTarget, 260.0f);
+    const float nErrCloseness = distanceCloseness(nErrDistance, std::max(28.0f, nDistToTarget));
+    const float oDistCloseness = distanceCloseness(oDistToTarget, 2200.0f);
+    const float oErrCloseness = distanceCloseness(oErrDistance, std::max(220.0f, oDistToTarget));
+
+    const std::string adjustmentText = formatSignedAdjustment(snap.angleAdjustmentDeg);
+    const double adjustmentStepDeg = std::max(1e-6, std::abs(static_cast<double>(snap.angleAdjustmentStepDeg)));
+    const int adjustmentStepCount = static_cast<int>(std::lround(std::abs(static_cast<double>(snap.angleAdjustmentDeg)) / adjustmentStepDeg));
+    const std::string adjustmentStepText =
+        (adjustmentStepCount > 0)
+            ? std::string((snap.angleAdjustmentDeg >= 0.0f) ? "+" : "-") + std::to_string(adjustmentStepCount)
+            : std::string("0");
+    const ImU32 adjustmentStepColor =
+        (adjustmentStepCount == 0) ? mutedColor : ((snap.angleAdjustmentDeg >= 0.0f) ? topAdjPlusColor : topAdjMinusColor);
+
+    const float alignmentRatio = snap.showComputedDetails ? std::clamp(1.0f - std::abs(snap.relativeYaw) / 90.0f, 0.0f, 1.0f) : 0.0f;
+    const int aimPercent = static_cast<int>(std::lround(alignmentRatio * 100.0f));
+    const bool hasStatusCertainty = snap.hasTopCertainty || snap.hasCombinedCertainty;
+    const float statusCertaintyPercent = snap.hasTopCertainty ? snap.topCertaintyPercent
+                                                              : (snap.hasCombinedCertainty ? snap.combinedCertaintyPercent : 50.0f);
+    const bool showDistanceMetrics = !snap.mcsrSafeMode;
+    const bool showBottomInfo = snap.showComputedDetails;
+
+    std::string summaryLine = snap.showAlignmentText ? ("A" + std::to_string(aimPercent) + "%") : "";
+
+    std::string guidanceLine;
+    ImU32 guidanceColor = mutedColor;
+    const bool shouldShowMoveGuidance = snap.hasNextThrowDirection && (!snap.hasTopCertainty || snap.topCertaintyPercent < 95.0f);
+    if (shouldShowMoveGuidance) {
+        std::ostringstream ss;
+        ss << "L" << snap.moveLeftBlocks << " / R" << snap.moveRightBlocks << " -> 95%";
+        guidanceLine = ss.str();
+        guidanceColor = warningColor;
+    } else if (!snap.warningLabel.empty()) {
+        guidanceLine = RT_TruncateSingleLine(snap.warningLabel, 96);
+        guidanceColor = warningColor;
+    } else if (!snap.infoLabel.empty()) {
+        guidanceLine = RT_TruncateSingleLine(snap.infoLabel, 96);
+        if (showBottomInfo) {
+            const size_t adjPos = guidanceLine.find(" | Adj ");
+            if (adjPos != std::string::npos) {
+                const size_t nextSep = guidanceLine.find(" | ", adjPos + 1);
+                if (nextSep != std::string::npos) {
+                    guidanceLine.erase(adjPos, nextSep - adjPos);
+                } else {
+                    guidanceLine.erase(adjPos);
+                }
+            }
+        }
+    }
+
+    const bool showAltCandidate = (!snap.hasTopCertainty || snap.topCertaintyPercent < 95.0f) && !snap.topCandidate2Label.empty();
+    const std::string candidate1 = RT_TruncateSingleLine(snap.topCandidate1Label, 66);
+    const std::string candidate2 = RT_TruncateSingleLine(snap.topCandidate2Label, 66);
+    struct CandidatePercentSpan {
+        bool valid = false;
+        size_t start = 0;
+        size_t end = 0;
+        float pct = 0.0f;
+    };
+    auto parsePercentSpan = [](const std::string& text) {
+        CandidatePercentSpan span;
+        const size_t percentPos = text.find('%');
+        if (percentPos == std::string::npos || percentPos == 0) return span;
+        size_t start = percentPos;
+        while (start > 0) {
+            const char c = text[start - 1];
+            const bool isDigit = (c >= '0' && c <= '9');
+            if (!isDigit && c != '.') break;
+            --start;
+        }
+        if (start >= percentPos) return span;
+        try {
+            span.pct = std::stof(text.substr(start, percentPos - start));
+            span.start = start;
+            span.end = percentPos + 1;
+            span.valid = true;
+        } catch (...) {}
+        return span;
+    };
+    auto certaintyColorFromPercent = [&](float pct) {
+        const float t = std::clamp(pct / 100.0f, 0.0f, 1.0f);
+        float r = 255.0f;
+        float g = 96.0f;
+        float b = 96.0f;
+        if (t < 0.5f) {
+            const float u = t / 0.5f;
+            g = 96.0f + (159.0f * u);
+            b = 96.0f;
+        } else {
+            const float u = (t - 0.5f) / 0.5f;
+            r = 255.0f - (159.0f * u);
+            g = 255.0f;
+            b = 96.0f;
+        }
+        return IM_COL32(static_cast<int>(std::lround(r)), static_cast<int>(std::lround(g)), static_cast<int>(std::lround(b)), textAlpha);
+    };
+    const CandidatePercentSpan candidate1Pct = parsePercentSpan(candidate1);
+    const CandidatePercentSpan candidate2Pct = parsePercentSpan(candidate2);
+    const ImU32 candidateTopBaseColor = IM_COL32(218, 228, 236, textAlpha);
+    const ImU32 candidateAltBaseColor = mutedColor;
+    const float candidateTopFont = metaFontSize * 1.06f;
+    const float candidateAltFont = metaFontSize;
+    const ImU32 candidateTopChipFill = IM_COL32(74, 96, 126, std::max(26, textAlpha / 4));
+    const ImU32 candidateTopChipBorder = IM_COL32(132, 164, 196, std::max(34, textAlpha / 3));
+
+    const float displayW = ImGui::GetIO().DisplaySize.x;
+    const bool useSideLane = !snap.showDirectionArrow;
+    const float fixedPanelWidthPx = showEstimateValues ? 1180.0f : 980.0f;
+    const float panelWidth = std::clamp(fixedPanelWidthPx, 360.0f, std::max(360.0f, displayW - 16.0f));
+
+    int leftLineCount = 1;
+    int sideLineCount = 0;
+    if (snap.showComputedDetails) {
+        leftLineCount += 3;
+        leftLineCount += 1; // Summary row
+        if (useSideLane) {
+            if (!candidate1.empty()) sideLineCount += 1;
+            if (showAltCandidate) sideLineCount += 1;
+        } else {
+            if (!candidate1.empty()) leftLineCount += 1;
+            if (showAltCandidate) leftLineCount += 1;
+        }
+    } else {
+        leftLineCount += 1;
+        if (useSideLane) {
+            if (!guidanceLine.empty()) sideLineCount += 1;
+        } else {
+            if (!guidanceLine.empty()) leftLineCount += 1;
+        }
+    }
+    if (showBottomInfo) leftLineCount += 1;
+    const float leftContentHeight = lineAdvance * std::max(1, leftLineCount - 1);
+    const float sideContentHeight = lineAdvance * std::max(0, sideLineCount);
+    const float panelHeight = (padY * 2.0f) + (headerFontSize + sectionGap) + std::max(leftContentHeight, sideContentHeight);
+
+    const float centeredX = std::max(0.0f, (displayW - panelWidth) * 0.5f);
+    const ImVec2 panelMin(centeredX, static_cast<float>(snap.y));
+    const ImVec2 panelMax(panelMin.x + panelWidth, panelMin.y + panelHeight);
+    const float textClipMinX = panelMin.x + padX - (2.0f * uiScale);
+    const auto textWidth = [&](const std::string& s, float fontSize) {
+        if (s.empty()) return 0.0f;
+        return font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, s.c_str()).x;
+    };
+    const float sideCandidate1W = textWidth(candidate1, candidateTopFont);
+    const float sideCandidate2W = showAltCandidate ? textWidth(candidate2, candidateAltFont) : 0.0f;
+    const float sideGuidanceW = (useSideLane && !showBottomInfo) ? textWidth(guidanceLine, metaFontSize) : 0.0f;
+    const float sideNeededTextW = std::max(120.0f, std::max(sideCandidate1W, std::max(sideCandidate2W, sideGuidanceW)));
+    const float dynamicSideLaneW = std::clamp(sideNeededTextW + (20.0f * uiScale), 190.0f, std::max(190.0f, panelWidth * 0.52f));
+    float sideClipMaxX = panelMax.x - padX - (4.0f * uiScale);
+    float sideClipMinX = panelMin.x + padX;
+    float textClipMaxX = panelMax.x - padX - std::min(240.0f, panelWidth * 0.40f);
+    if (useSideLane) {
+        sideClipMinX = std::max(panelMin.x + padX, sideClipMaxX - dynamicSideLaneW);
+        textClipMaxX = std::max(textClipMinX + 140.0f, sideClipMinX - (10.0f * uiScale));
+    } else {
+        const float rightCompassLaneW = std::min(240.0f, panelWidth * 0.40f);
+        textClipMaxX = std::max(textClipMinX + 140.0f, panelMax.x - padX - rightCompassLaneW);
+    }
+
+    drawList->AddRectFilled(panelMin, panelMax, bgColor, 10.0f * uiScale);
+    drawList->AddRect(panelMin, panelMax, borderColor, 10.0f * uiScale, 0, std::max(1.0f, 1.4f * uiScale));
+
+    auto drawSeg = [&](float& x, float y, const std::string& text, ImU32 color, float fontSize) {
+        if (text.empty()) return;
+        drawList->PushClipRect(ImVec2(textClipMinX, panelMin.y), ImVec2(textClipMaxX, panelMax.y), true);
+        drawList->AddText(font, fontSize, ImVec2(x, y), color, text.c_str());
+        drawList->PopClipRect();
+        x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text.c_str()).x;
+    };
+    auto drawSideLine = [&](float& sideY, const std::string& text, ImU32 color, float fontSize) {
+        if (text.empty()) return;
+        drawList->PushClipRect(ImVec2(sideClipMinX, panelMin.y), ImVec2(sideClipMaxX, panelMax.y), true);
+        drawList->AddText(font, fontSize, ImVec2(sideClipMinX, sideY), color, text.c_str());
+        drawList->PopClipRect();
+        sideY += lineAdvance;
+    };
+    auto drawSideSeg = [&](float& xPos, float yPos, const std::string& text, ImU32 color, float fontSize) {
+        if (text.empty()) return;
+        drawList->PushClipRect(ImVec2(sideClipMinX, panelMin.y), ImVec2(sideClipMaxX, panelMax.y), true);
+        drawList->AddText(font, fontSize, ImVec2(xPos, yPos), color, text.c_str());
+        drawList->PopClipRect();
+        xPos += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text.c_str()).x;
+    };
+    auto drawCandidateLine = [&](float startX, float yPos, const std::string& text, const CandidatePercentSpan& span, ImU32 baseColor,
+                                 float fontSize, bool sideLane) {
+        if (text.empty()) return;
+        auto drawFn = [&](float& xp, const std::string& s, ImU32 c) {
+            if (sideLane) {
+                drawSideSeg(xp, yPos, s, c, fontSize);
+            } else {
+                drawSeg(xp, yPos, s, c, fontSize);
+            }
+        };
+        float xp = startX;
+        if (span.valid && span.end <= text.size()) {
+            drawFn(xp, text.substr(0, span.start), baseColor);
+            drawFn(xp, text.substr(span.start, span.end - span.start), certaintyColorFromPercent(span.pct));
+            drawFn(xp, text.substr(span.end), baseColor);
+        } else {
+            drawFn(xp, text, baseColor);
+        }
+    };
+    auto drawCandidateChip = [&](float startX, float yPos, const std::string& text, float fontSize, bool sideLane) {
+        if (text.empty()) return;
+        const float textW = textWidth(text, fontSize);
+        const float chipPadX = 6.0f * uiScale;
+        const float chipH = std::max(12.0f, fontSize + (5.0f * uiScale));
+        const ImVec2 minPt(startX - chipPadX, yPos - (2.0f * uiScale));
+        const ImVec2 maxPt(startX + textW + chipPadX, minPt.y + chipH);
+        if (sideLane) {
+            drawList->PushClipRect(ImVec2(sideClipMinX, panelMin.y), ImVec2(sideClipMaxX, panelMax.y), true);
+        } else {
+            drawList->PushClipRect(ImVec2(textClipMinX, panelMin.y), ImVec2(textClipMaxX, panelMax.y), true);
+        }
+        drawList->AddRectFilled(minPt, maxPt, candidateTopChipFill, 5.0f * uiScale);
+        drawList->AddRect(minPt, maxPt, candidateTopChipBorder, 5.0f * uiScale, 0, std::max(1.0f, 1.0f * uiScale));
+        drawList->PopClipRect();
+    };
+
+    float y = panelMin.y + padY;
+    float x = panelMin.x + padX;
+    const float lockIconSize = std::max(10.0f, headerFontSize * 0.92f);
+    DrawLockBadgeImGui(drawList, ImVec2(x, y + (headerFontSize - lockIconSize) * 0.5f), lockIconSize, snap.targetLocked, statusColor, lineColor);
+    const float topBoatIconSize = std::max(10.0f, headerFontSize * 0.90f);
+    const ImVec2 topBoatCenter(panelMax.x - padX - (topBoatIconSize * 0.56f), panelMin.y + padY + (topBoatIconSize * 0.56f));
+    DrawStrongholdStatusIconImGui(drawList, topBoatCenter, topBoatIconSize, snap.boatModeEnabled, snap.boatState, hasStatusCertainty,
+                                  statusCertaintyPercent, boatBlueColor, boatGreenColor, boatRedColor, mutedColor);
+
+    if (snap.showDirectionArrow) {
+        const float alignment = snap.showComputedDetails ? alignmentRatio : 0.5f;
+        const int arrowR = static_cast<int>(std::lround(255.0f - 125.0f * alignment));
+        const int arrowG = static_cast<int>(std::lround(120.0f + 135.0f * alignment));
+        const int arrowB = static_cast<int>(std::lround(110.0f + 60.0f * alignment));
+        const ImU32 arrowColor = IM_COL32(arrowR, arrowG, arrowB, textAlpha);
+        const ImU32 ringColor = IM_COL32(225, 240, 255, std::max(40, textAlpha / 2));
+        const float desiredArrowRadiusPx = 70.0f;
+        const float compassLaneW = std::min(240.0f, panelWidth * 0.40f);
+        const float arrowRadius =
+            std::clamp(desiredArrowRadiusPx, 24.0f, std::max(24.0f, std::min((compassLaneW * 0.50f) - 8.0f, (panelHeight * 0.48f) - padY)));
+        float arrowCenterX = panelMax.x - padX - arrowRadius - (2.0f * uiScale);
+        arrowCenterX = std::max(arrowCenterX, panelMin.x + (panelWidth * 0.62f));
+        float arrowCenterY = panelMin.y + (panelHeight * 0.50f);
+        arrowCenterY = std::clamp(arrowCenterY, panelMin.y + padY + arrowRadius, panelMax.y - padY - arrowRadius);
+        const ImVec2 arrowCenter(arrowCenterX, arrowCenterY);
+        DrawContinuousCompassArrow(drawList, arrowCenter, arrowRadius, snap.relativeYaw, arrowColor, ringColor);
+    }
+
+    y += headerFontSize + sectionGap;
+    float sideY = y;
+
+    auto drawCompactWorldRow = [&](char worldId, int targetX, int targetZ, int estX, int estZ, int dx, int dz, int xPct, int zPct,
+                                   float xCloseness, float zCloseness, float distToTarget, float errDistance, float distCloseness,
+                                   float errCloseness) {
+        const ImU32 xAxisColor = axisColorFromCloseness(xCloseness);
+        const ImU32 zAxisColor = axisColorFromCloseness(zCloseness);
+        const ImU32 distColor = axisColorFromCloseness(distCloseness);
+        const ImU32 errColor = axisColorFromCloseness(errCloseness);
+        const bool emphasizeWorld = (worldId == 'N');
+        const float targetFontSize = rowFontSize * (emphasizeWorld ? 1.20f : 1.06f);
+        const float aimFontSize = rowFontSize * (emphasizeWorld ? 1.14f : 1.03f);
+        float cx = panelMin.x + padX;
+        const ImU32 worldBadgeFill = emphasizeWorld ? IM_COL32(56, 98, 136, textAlpha) : IM_COL32(52, 76, 100, textAlpha);
+        const ImU32 worldBadgeText = IM_COL32(232, 244, 255, textAlpha);
+        const float badgeFontSize = rowFontSize * (emphasizeWorld ? 1.02f : 0.98f);
+        const float badgeY = y + std::max(0.0f, (targetFontSize - badgeFontSize) * 0.10f);
+        const float badgeW =
+            DrawWorldBadgeImGui(drawList, font, ImVec2(cx, badgeY), badgeFontSize, worldId, worldBadgeFill, worldBadgeText, axisDividerColor);
+        cx += badgeW + (6.0f * uiScale);
+
+        drawSeg(cx, y, "T(", highlightColor, targetFontSize);
+        drawSeg(cx, y, std::to_string(targetX), highlightColor, targetFontSize);
+        drawSeg(cx, y, ",", axisDividerColor, targetFontSize);
+        drawSeg(cx, y, std::to_string(targetZ), highlightColor, targetFontSize);
+        drawSeg(cx, y, ") ", highlightColor, targetFontSize);
+        if (showDistanceMetrics) {
+            drawSeg(cx, y, "@", mutedColor, rowFontSize);
+            drawSeg(cx, y, std::to_string(static_cast<int>(std::lround(distToTarget))), distColor, rowFontSize);
+        }
+        if (showEstimateValues) {
+            drawSeg(cx, y, "  E(", mutedColor, aimFontSize);
+            drawSeg(cx, y, std::to_string(estX), xAxisColor, aimFontSize);
+            drawSeg(cx, y, ",", axisDividerColor, aimFontSize);
+            drawSeg(cx, y, std::to_string(estZ), zAxisColor, aimFontSize);
+            drawSeg(cx, y, ") ", mutedColor, aimFontSize);
+            drawSeg(cx, y, "D(", mutedColor, rowFontSize);
+            drawSeg(cx, y, formatSignedInt(dx), xAxisColor, rowFontSize);
+            drawSeg(cx, y, ",", axisDividerColor, rowFontSize);
+            drawSeg(cx, y, formatSignedInt(dz), zAxisColor, rowFontSize);
+            drawSeg(cx, y, ") ", mutedColor, rowFontSize);
+            drawSeg(cx, y, "[", mutedColor, rowFontSize);
+            drawSeg(cx, y, std::to_string(xPct), xAxisColor, rowFontSize);
+            drawSeg(cx, y, "|", axisDividerColor, rowFontSize);
+            drawSeg(cx, y, std::to_string(zPct), zAxisColor, rowFontSize);
+            drawSeg(cx, y, "] ", mutedColor, rowFontSize);
+            drawSeg(cx, y, "~", mutedColor, rowFontSize);
+            drawSeg(cx, y, std::to_string(static_cast<int>(std::lround(errDistance))), errColor, rowFontSize);
+        }
+
+        const float rowScale = emphasizeWorld ? 1.12f : 1.0f;
+        y += lineAdvance * rowScale;
+    };
+
+    if (snap.showComputedDetails) {
+        drawCompactWorldRow('N', snap.targetNetherX, snap.targetNetherZ, snap.estimatedNetherX, snap.estimatedNetherZ, nDx, nDz, nXPct, nZPct,
+                            nXCloseness, nZCloseness, nDistToTarget, nErrDistance, nDistCloseness, nErrCloseness);
+        drawCompactWorldRow('O', snap.targetOverworldX, snap.targetOverworldZ, snap.estimatedOverworldX, snap.estimatedOverworldZ, oDx, oDz,
+                            oXPct, oZPct, oXCloseness, oZCloseness, oDistToTarget, oErrDistance, oDistCloseness, oErrCloseness);
+
+        float sx = panelMin.x + padX;
+        drawSeg(sx, y, summaryLine, lineColor, metaFontSize);
+        y += lineAdvance;
+
+        if (useSideLane) {
+            if (!candidate1.empty()) drawCandidateChip(sideClipMinX, sideY, candidate1, candidateTopFont, true);
+            drawCandidateLine(sideClipMinX, sideY, candidate1, candidate1Pct, candidateTopBaseColor, candidateTopFont, true);
+            sideY += lineAdvance * 1.04f;
+            if (showAltCandidate) {
+                drawCandidateLine(sideClipMinX, sideY, candidate2, candidate2Pct, candidateAltBaseColor, candidateAltFont, true);
+                sideY += lineAdvance;
+            }
+        } else {
+            if (!candidate1.empty()) {
+                drawCandidateChip(panelMin.x + padX, y, candidate1, candidateTopFont, false);
+                drawCandidateLine(panelMin.x + padX, y, candidate1, candidate1Pct, candidateTopBaseColor, candidateTopFont, false);
+                y += lineAdvance * 1.04f;
+            }
+            if (showAltCandidate) {
+                drawCandidateLine(panelMin.x + padX, y, candidate2, candidate2Pct, candidateAltBaseColor, candidateAltFont, false);
+                y += lineAdvance;
+            }
+        }
+
+        const std::string adjPrefix = adjustmentText + " ";
+        const std::string adjStep = "[" + adjustmentStepText + "]";
+        const std::string bottomSep = guidanceLine.empty() ? "" : "  |  ";
+        const float adjPrefixW = textWidth(adjPrefix, metaFontSize);
+        const float adjStepW = textWidth(adjStep, metaFontSize);
+        const float sepW = textWidth(bottomSep, metaFontSize);
+        const float guideW = textWidth(guidanceLine, metaFontSize);
+        const float totalW = adjPrefixW + adjStepW + sepW + guideW;
+        const float bottomY = panelMax.y - padY - lineAdvance;
+        float bx = panelMin.x + std::max(padX, (panelWidth - totalW) * 0.5f);
+        drawList->PushClipRect(ImVec2(panelMin.x + padX, panelMin.y), ImVec2(panelMax.x - padX, panelMax.y), true);
+        drawList->AddText(font, metaFontSize, ImVec2(bx, bottomY), topAdjColor, adjPrefix.c_str());
+        bx += adjPrefixW;
+        drawList->AddText(font, metaFontSize, ImVec2(bx, bottomY), adjustmentStepColor, adjStep.c_str());
+        bx += adjStepW;
+        if (!bottomSep.empty()) {
+            drawList->AddText(font, metaFontSize, ImVec2(bx, bottomY), mutedColor, bottomSep.c_str());
+            bx += sepW;
+            drawList->AddText(font, metaFontSize, ImVec2(bx, bottomY), guidanceColor, guidanceLine.c_str());
+        }
+        drawList->PopClipRect();
+    } else {
+        float cx = panelMin.x + padX;
+        drawSeg(cx, y, "[S+H] [H]", mutedColor, metaFontSize);
+        y += lineAdvance;
+        if (useSideLane) {
+            drawSideLine(sideY, guidanceLine, guidanceColor, metaFontSize);
+        } else if (!guidanceLine.empty()) {
+            cx = panelMin.x + padX;
+            drawSeg(cx, y, guidanceLine, guidanceColor, metaFontSize);
+            y += lineAdvance;
+        }
+    }
+}
+
+static void RT_RenderStrongholdOverlayImGui(const StrongholdOverlayRenderSnapshot& snap, bool drawBehindGui) {
+    if (!snap.enabled || !snap.visible) return;
+    if (!ImGui::GetCurrentContext()) return;
+
+    if (snap.hudLayoutMode != 0) {
+        RT_RenderStrongholdOverlayImGuiCompact(snap, drawBehindGui);
+        return;
+    }
+
+    ImDrawList* drawList = drawBehindGui ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+    ImFont* font = ImGui::GetFont();
+    if (!drawList || !font) return;
+
+    float uiScale = std::clamp(snap.scale, 0.4f, 3.0f);
+    float baseFontSize = ImGui::GetFontSize() * uiScale * 1.30f;
+    float statusFontSize = baseFontSize * 1.24f;
+    float arrowFontSize = baseFontSize * 3.15f;
+    float lineFontSize = baseFontSize * 1.08f;
+    float lineAdvance = lineFontSize * 1.32f;
+    const bool showEstimateValues = snap.showEstimateValues;
+    const bool showDistanceMetrics = !snap.mcsrSafeMode;
+    float padX = 18.0f * uiScale;
+    float padY = 14.0f * uiScale;
+    float sectionGap = 9.0f * uiScale;
+
+    std::vector<std::string> lines;
+    std::string targetNetherXText;
+    std::string targetNetherZText;
+    std::string estimatedNetherXText;
+    std::string estimatedNetherZText;
+    std::string targetOverworldXText;
+    std::string targetOverworldZText;
+    std::string estimatedOverworldXText;
+    std::string estimatedOverworldZText;
+    std::string playerNetherXText;
+    std::string playerNetherZText;
+    std::string playerOverworldXText;
+    std::string playerOverworldZText;
+    bool hasCoordRows = false;
+    int boatLineIndex = -1;
+    int warningLineIndex = -1;
+    std::string topAdjustmentText;
+    std::string topAdjustmentStepText;
+    bool showTopAdjustment = false;
+    bool topAdjustmentStepActive = false;
+    auto formatSignedAdjustment = [](float value) {
+        std::ostringstream out;
+        out << std::showpos << std::fixed;
+        if (std::abs(value) < 0.1f) {
+            out << std::setprecision(3) << value;
+        } else {
+            out << std::setprecision(2) << value;
+        }
+        return out.str();
+    };
+    if (snap.showComputedDetails) {
+        std::ostringstream distStream;
+        distStream << std::fixed << std::setprecision(0) << snap.distanceDisplay;
+        const std::string angleAdjText = formatSignedAdjustment(snap.angleAdjustmentDeg);
+        topAdjustmentText = "Adj " + angleAdjText + " deg";
+        const double stepDeg = std::max(1e-6, std::abs(static_cast<double>(snap.angleAdjustmentStepDeg)));
+        const int adjustmentStepCount = static_cast<int>(std::lround(std::abs(static_cast<double>(snap.angleAdjustmentDeg)) / stepDeg));
+        if (adjustmentStepCount > 0) {
+            const bool isPositiveAdjustment = snap.angleAdjustmentDeg > 0.0f;
+            topAdjustmentStepText = std::string(isPositiveAdjustment ? "+" : "-") + std::to_string(adjustmentStepCount);
+            topAdjustmentStepActive = true;
+        } else {
+            topAdjustmentStepText = "0";
+            topAdjustmentStepActive = false;
+        }
+        showTopAdjustment = true;
+        lines.push_back("Mode: " + snap.modeLabel + "  Feed: " + (snap.usingLiveTarget ? "LIVE" : "LOCK"));
+        lines.push_back("Throws: " + std::to_string(snap.activeEyeThrowCount));
+        targetNetherXText = std::to_string(snap.targetNetherX);
+        targetNetherZText = std::to_string(snap.targetNetherZ);
+        estimatedNetherXText = std::to_string(snap.estimatedNetherX);
+        estimatedNetherZText = std::to_string(snap.estimatedNetherZ);
+        targetOverworldXText = std::to_string(snap.targetOverworldX);
+        targetOverworldZText = std::to_string(snap.targetOverworldZ);
+        estimatedOverworldXText = std::to_string(snap.estimatedOverworldX);
+        estimatedOverworldZText = std::to_string(snap.estimatedOverworldZ);
+        playerNetherXText = std::to_string(snap.playerNetherX);
+        playerNetherZText = std::to_string(snap.playerNetherZ);
+        playerOverworldXText = std::to_string(snap.playerOverworldX);
+        playerOverworldZText = std::to_string(snap.playerOverworldZ);
+        hasCoordRows = true;
+        if (showDistanceMetrics) {
+            lines.push_back("Dist OW: " + distStream.str());
+        }
+        if (snap.showAlignmentText) {
+            const float alignmentRatio = std::clamp(1.0f - std::abs(snap.relativeYaw) / 90.0f, 0.0f, 1.0f);
+            const int alignmentPercent = static_cast<int>(std::lround(alignmentRatio * 100.0f));
+            lines.push_back("Aim: " + std::to_string(alignmentPercent) + "%");
+        }
+        lines.push_back("Adj: " + angleAdjText + " deg");
+        boatLineIndex = static_cast<int>(lines.size());
+        lines.push_back(snap.boatLabel);
+        if (snap.hasTopCertainty) {
+            std::ostringstream certaintyStream;
+            certaintyStream << std::fixed << std::setprecision(1) << snap.topCertaintyPercent;
+            lines.push_back("OW %: " + certaintyStream.str());
+        }
+        if (snap.hasCombinedCertainty) {
+            std::ostringstream combinedStream;
+            combinedStream << std::fixed << std::setprecision(1) << snap.combinedCertaintyPercent;
+            lines.push_back("Hit %: " + combinedStream.str());
+        }
+        if (snap.hasNextThrowDirection) {
+            lines.push_back("Go left " + std::to_string(snap.moveLeftBlocks) + " blocks, or right " +
+                            std::to_string(snap.moveRightBlocks) + " blocks, for ~95% certainty after next measurement.");
+        }
+        if (!snap.topCandidate1Label.empty()) lines.push_back(snap.topCandidate1Label);
+        if (!snap.topCandidate2Label.empty()) lines.push_back(snap.topCandidate2Label);
+        if (!snap.warningLabel.empty()) {
+            warningLineIndex = static_cast<int>(lines.size());
+            lines.push_back(snap.warningLabel);
+        }
+        if (!snap.infoLabel.empty()) lines.push_back(snap.infoLabel);
+    } else {
+        boatLineIndex = static_cast<int>(lines.size());
+        lines.push_back(snap.boatLabel);
+        if (!snap.warningLabel.empty()) {
+            warningLineIndex = static_cast<int>(lines.size());
+            lines.push_back(snap.warningLabel);
+        }
+        if (!snap.infoLabel.empty()) lines.push_back(snap.infoLabel);
+    }
+
+    ImVec2 statusSize = font->CalcTextSizeA(statusFontSize, FLT_MAX, 0.0f, snap.statusLabel.c_str());
+    const bool showArrowGlyph = snap.showDirectionArrow;
+    const char* idleArrowLabel = "^";
+    const float arrowVisualSize = showArrowGlyph ? (arrowFontSize * 0.95f) : 0.0f;
+    ImVec2 arrowSize = showArrowGlyph ? ImVec2(arrowVisualSize, arrowVisualSize) : ImVec2(0, 0);
+    const float topAdjFontSize = lineFontSize * 1.12f;
+    const float topAdjStepFontSize = lineFontSize * 1.72f;
+    ImVec2 topAdjTextSize = showTopAdjustment ? font->CalcTextSizeA(topAdjFontSize, FLT_MAX, 0.0f, topAdjustmentText.c_str()) : ImVec2(0, 0);
+    ImVec2 topAdjStepSize = (!topAdjustmentStepText.empty())
+                                ? font->CalcTextSizeA(topAdjStepFontSize, FLT_MAX, 0.0f, topAdjustmentStepText.c_str())
+                                : ImVec2(0, 0);
+    ImVec2 topAdjStepReserveSize = showTopAdjustment ? font->CalcTextSizeA(topAdjStepFontSize, FLT_MAX, 0.0f, "+999") : ImVec2(0, 0);
+    const float topAdjStepSlotWidth = std::max(topAdjStepSize.x, topAdjStepReserveSize.x);
+    const float topAdjGap = 9.0f * uiScale;
+    const float topAdjWidth = showTopAdjustment ? (topAdjTextSize.x + topAdjGap + topAdjStepSlotWidth) : 0.0f;
+    const float topAdjHeight = showTopAdjustment ? std::max(topAdjTextSize.y, topAdjStepSize.y) : 0.0f;
+
+    float maxLineWidth = 0.0f;
+    for (const auto& line : lines) {
+        ImVec2 lineSize = font->CalcTextSizeA(lineFontSize, FLT_MAX, 0.0f, line.c_str());
+        if (lineSize.x > maxLineWidth) maxLineWidth = lineSize.x;
+    }
+
+    const std::string targetNetherPrefix = "Target N XZ: ";
+    const std::string estimatedNetherPrefix = "Est N XZ: ";
+    const std::string targetOverworldPrefix = "Target O XZ: ";
+    const std::string estimatedOverworldPrefix = "Est O XZ: ";
+    const std::string playerNetherPrefix = "You N XZ: ";
+    const std::string playerOverworldPrefix = "You O XZ: ";
+    const std::string coordSep = ", ";
+    const std::string deltaXPrefix = "  dX ";
+    const std::string deltaZPrefix = " dZ ";
+    auto formatSignedInt = [](int value) {
+        std::ostringstream out;
+        out << std::showpos << value;
+        return out.str();
+    };
+    const std::string dxNetherText = formatSignedInt(snap.estimatedNetherX - snap.targetNetherX);
+    const std::string dzNetherText = formatSignedInt(snap.estimatedNetherZ - snap.targetNetherZ);
+    const std::string dxOverworldText = formatSignedInt(snap.estimatedOverworldX - snap.targetOverworldX);
+    const std::string dzOverworldText = formatSignedInt(snap.estimatedOverworldZ - snap.targetOverworldZ);
+    if (hasCoordRows) {
+        const float emphasizedCoordFontSize = lineFontSize * 1.86f;
+        auto rowWidth = [&](const std::string& prefix, const std::string& xText, const std::string& zText, float fontSize) {
+            return font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, prefix.c_str()).x +
+                   font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, xText.c_str()).x +
+                   font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, coordSep.c_str()).x +
+                   font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, zText.c_str()).x;
+        };
+        auto estimatedRowWidth = [&](const std::string& prefix, const std::string& xText, const std::string& zText, const std::string& dxText,
+                                     const std::string& dzText, float fontSize) {
+            return rowWidth(prefix, xText, zText, fontSize) +
+                   font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, deltaXPrefix.c_str()).x +
+                   font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, dxText.c_str()).x +
+                   font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, deltaZPrefix.c_str()).x +
+                   font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, dzText.c_str()).x;
+        };
+        float widthTargetN = rowWidth(targetNetherPrefix, targetNetherXText, targetNetherZText, emphasizedCoordFontSize);
+        float widthEstN =
+            showEstimateValues ? estimatedRowWidth(estimatedNetherPrefix, estimatedNetherXText, estimatedNetherZText, dxNetherText, dzNetherText,
+                                                   lineFontSize)
+                               : 0.0f;
+        float widthTargetO = rowWidth(targetOverworldPrefix, targetOverworldXText, targetOverworldZText, lineFontSize);
+        float widthEstO = showEstimateValues
+                              ? estimatedRowWidth(estimatedOverworldPrefix, estimatedOverworldXText, estimatedOverworldZText, dxOverworldText,
+                                                  dzOverworldText, lineFontSize)
+                              : 0.0f;
+        float widthPlayerN = rowWidth(playerNetherPrefix, playerNetherXText, playerNetherZText, lineFontSize);
+        float widthPlayerO = rowWidth(playerOverworldPrefix, playerOverworldXText, playerOverworldZText, lineFontSize);
+        float coordMaxWidth = std::max(std::max(widthTargetN, widthTargetO), std::max(widthPlayerN, widthPlayerO));
+        if (showEstimateValues) { coordMaxWidth = std::max(coordMaxWidth, std::max(widthEstN, widthEstO)); }
+        maxLineWidth = std::max(maxLineWidth, coordMaxWidth);
+    }
+
+    float contentWidth = std::max(statusSize.x, std::max(arrowSize.x, std::max(maxLineWidth, topAdjWidth)));
+    float panelWidth = std::max(280.0f * uiScale, contentWidth + padX * 2.0f);
+    float linesHeight = lines.empty() ? 0.0f : (lineAdvance * static_cast<float>(lines.size()));
+    if (hasCoordRows) linesHeight += lineAdvance * (showEstimateValues ? 12.2f : 4.4f);
+    float panelHeight = padY + statusSize.y + sectionGap;
+    if (showTopAdjustment) panelHeight += topAdjHeight + sectionGap;
+    if (showArrowGlyph) panelHeight += arrowSize.y + sectionGap;
+    panelHeight += linesHeight + padY;
+
+    const float displayW = ImGui::GetIO().DisplaySize.x;
+    const float centeredX = std::max(0.0f, (displayW - panelWidth) * 0.5f);
+    ImVec2 panelMin(centeredX, static_cast<float>(snap.y));
+    ImVec2 panelMax(panelMin.x + panelWidth, panelMin.y + panelHeight);
+
+    int textAlpha = static_cast<int>(std::clamp(snap.overlayOpacity, 0.0f, 1.0f) * 255.0f);
+    int bgAlpha = static_cast<int>(std::clamp(snap.overlayOpacity * snap.backgroundOpacity, 0.0f, 1.0f) * 255.0f);
+    ImU32 bgColor = IM_COL32(7, 15, 24, bgAlpha);
+    ImU32 borderColor = IM_COL32(155, 225, 190, textAlpha);
+    ImU32 statusColor =
+        snap.targetLocked ? IM_COL32(255, 235, 140, textAlpha) : IM_COL32(180, 255, 200, textAlpha);
+    float alignmentRatio = snap.showComputedDetails ? std::clamp(1.0f - std::abs(snap.relativeYaw) / 90.0f, 0.0f, 1.0f) : 0.5f;
+    int arrowR = static_cast<int>(std::lround(255.0f - 125.0f * alignmentRatio));
+    int arrowG = static_cast<int>(std::lround(120.0f + 135.0f * alignmentRatio));
+    int arrowB = static_cast<int>(std::lround(110.0f + 60.0f * alignmentRatio));
+    ImU32 arrowColor = IM_COL32(arrowR, arrowG, arrowB, textAlpha);
+    ImU32 lineColor = IM_COL32(242, 248, 255, textAlpha);
+    ImU32 mutedColor = IM_COL32(196, 220, 236, textAlpha);
+    ImU32 negativeColor = IM_COL32(255, 165, 165, textAlpha);
+    ImU32 boatBlueColor = IM_COL32(130, 185, 255, textAlpha);
+    ImU32 boatGreenColor = IM_COL32(130, 255, 160, textAlpha);
+    ImU32 boatRedColor = IM_COL32(255, 130, 130, textAlpha);
+    ImU32 topAdjColor = IM_COL32(235, 246, 255, textAlpha);
+    ImU32 topAdjPlusColor = IM_COL32(130, 255, 160, textAlpha);
+    ImU32 topAdjMinusColor = IM_COL32(255, 130, 130, textAlpha);
+    ImU32 warningColor = IM_COL32(255, 150, 130, textAlpha);
+
+    drawList->AddRectFilled(panelMin, panelMax, bgColor, 11.0f * uiScale);
+    drawList->AddRect(panelMin, panelMax, borderColor, 11.0f * uiScale, 0, std::max(1.0f, 1.5f * uiScale));
+
+    float currentY = panelMin.y + padY;
+    ImVec2 statusPos(panelMin.x + (panelWidth - statusSize.x) * 0.5f, currentY);
+    drawList->AddText(font, statusFontSize, statusPos, statusColor, snap.statusLabel.c_str());
+
+    currentY += statusSize.y + sectionGap;
+    if (showTopAdjustment) {
+        float blockWidth = topAdjTextSize.x + topAdjGap + topAdjStepSlotWidth;
+        float blockX = panelMin.x + (panelWidth - blockWidth) * 0.5f;
+        drawList->AddText(font, topAdjFontSize, ImVec2(blockX, currentY + (topAdjHeight - topAdjTextSize.y) * 0.5f), topAdjColor,
+                          topAdjustmentText.c_str());
+        ImU32 stepColor = mutedColor;
+        if (topAdjustmentStepActive) { stepColor = (snap.angleAdjustmentDeg > 0.0f) ? topAdjPlusColor : topAdjMinusColor; }
+        const float stepX = blockX + topAdjTextSize.x + topAdjGap + (topAdjStepSlotWidth - topAdjStepSize.x) * 0.5f;
+        drawList->AddText(font, topAdjStepFontSize, ImVec2(stepX, currentY), stepColor, topAdjustmentStepText.c_str());
+        currentY += topAdjHeight + sectionGap;
+    }
+
+    if (showArrowGlyph) {
+        if (snap.showComputedDetails) {
+            const ImVec2 arrowCenter(panelMin.x + panelWidth * 0.5f, currentY + arrowSize.y * 0.5f);
+            const float arrowRadius = std::max(8.0f * uiScale, arrowSize.y * 0.46f);
+            const int ringAlpha = std::max(40, textAlpha / 2);
+            const ImU32 ringColor = IM_COL32(225, 240, 255, ringAlpha);
+            DrawContinuousCompassArrow(drawList, arrowCenter, arrowRadius, snap.relativeYaw, arrowColor, ringColor);
+        } else {
+            ImVec2 idleSize = font->CalcTextSizeA(arrowFontSize, FLT_MAX, 0.0f, idleArrowLabel);
+            ImVec2 arrowPos(panelMin.x + (panelWidth - idleSize.x) * 0.5f, currentY + (arrowSize.y - idleSize.y) * 0.5f);
+            drawList->AddText(font, arrowFontSize, arrowPos, arrowColor, idleArrowLabel);
+        }
+        currentY += arrowSize.y + sectionGap;
+    }
+    if (hasCoordRows) {
+        const float emphasizedCoordFontSize = lineFontSize * 1.86f;
+        const float estimatedCoordFontSize = lineFontSize * 1.02f;
+        const float axisLegendFontSize = lineFontSize * 0.84f;
+        const float axisBarHeight = std::max(6.0f * uiScale, lineFontSize * 0.27f);
+        const float axisBarSpacingX = std::max(10.0f * uiScale, lineFontSize * 0.52f);
+        const float axisBarLegendGap = std::max(2.0f * uiScale, lineFontSize * 0.12f);
+        const float axisBarAfterGap = std::max(5.0f * uiScale, lineFontSize * 0.26f);
+        const float axisBarWidth = std::max(86.0f * uiScale, (panelWidth - (padX * 2.0f) - axisBarSpacingX) * 0.5f);
+        const ImU32 emphasizedCoordColor = IM_COL32(255, 238, 145, textAlpha);
+        const ImU32 estimatedCoordColor = IM_COL32(145, 220, 255, textAlpha);
+        const ImU32 estimatedMetaColor = IM_COL32(196, 220, 236, textAlpha);
+        const ImU32 axisTrackColor = IM_COL32(38, 54, 68, std::max(60, static_cast<int>(textAlpha * 0.85f)));
+        const ImU32 axisTrackBorderColor = IM_COL32(98, 128, 146, std::max(70, static_cast<int>(textAlpha * 0.88f)));
+        auto axisColorFromCloseness = [&](float closeness) {
+            const float t = std::clamp(closeness, 0.0f, 1.0f);
+            const int r = static_cast<int>(std::lround(255.0f - 178.0f * t));
+            const int g = static_cast<int>(std::lround(96.0f + 159.0f * t));
+            const int b = static_cast<int>(std::lround(118.0f + 28.0f * t));
+            return IM_COL32(r, g, b, textAlpha);
+        };
+        auto closenessFromDelta = [&](int deltaAbs, int referenceAbs) {
+            const float denom = std::max(6.0f, static_cast<float>(referenceAbs));
+            return std::clamp(1.0f - (static_cast<float>(deltaAbs) / denom), 0.0f, 1.0f);
+        };
+        auto drawCoordRow = [&](const std::string& prefix, const std::string& xText, const std::string& zText, float fontSize,
+                                ImU32 prefixColor) {
+            float x = panelMin.x + padX;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), prefixColor, prefix.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, prefix.c_str()).x;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), NegativeAwareTextColor(xText, lineColor, negativeColor),
+                              xText.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, xText.c_str()).x;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), lineColor, coordSep.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, coordSep.c_str()).x;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), NegativeAwareTextColor(zText, lineColor, negativeColor),
+                              zText.c_str());
+            currentY += lineAdvance * (fontSize / lineFontSize);
+        };
+        auto drawAxisBar = [&](float x, float yTop, const char* axisLabel, float closeness, ImU32 axisColor, const std::string& deltaText) {
+            const int percent = static_cast<int>(std::lround(std::clamp(closeness, 0.0f, 1.0f) * 100.0f));
+            const std::string legend = std::string(axisLabel) + " " + std::to_string(percent) + "% " + deltaText;
+            drawList->AddText(font, axisLegendFontSize, ImVec2(x, yTop), axisColor, legend.c_str());
+
+            const float barTop = yTop + axisLegendFontSize + axisBarLegendGap;
+            const float barBottom = barTop + axisBarHeight;
+            const float barRight = x + axisBarWidth;
+            drawList->AddRectFilled(ImVec2(x, barTop), ImVec2(barRight, barBottom), axisTrackColor, axisBarHeight * 0.48f);
+            drawList->AddRect(ImVec2(x, barTop), ImVec2(barRight, barBottom), axisTrackBorderColor, axisBarHeight * 0.48f);
+            const float fillWidth = axisBarWidth * std::clamp(closeness, 0.0f, 1.0f);
+            if (fillWidth > 0.5f) {
+                drawList->AddRectFilled(ImVec2(x, barTop), ImVec2(x + fillWidth, barBottom), axisColor, axisBarHeight * 0.48f);
+            }
+        };
+        auto drawEstimatedCoordRow = [&](const std::string& prefix, int estimatedX, int estimatedZ, int targetX, int targetZ, int playerX,
+                                         int playerZ, float fontSize) {
+            const std::string xText = std::to_string(estimatedX);
+            const std::string zText = std::to_string(estimatedZ);
+            const std::string dxText = formatSignedInt(estimatedX - targetX);
+            const std::string dzText = formatSignedInt(estimatedZ - targetZ);
+            const int deltaXAbs = std::abs(estimatedX - targetX);
+            const int deltaZAbs = std::abs(estimatedZ - targetZ);
+            const int referenceXAbs = std::abs(playerX - targetX);
+            const int referenceZAbs = std::abs(playerZ - targetZ);
+            const float xCloseness = closenessFromDelta(deltaXAbs, referenceXAbs);
+            const float zCloseness = closenessFromDelta(deltaZAbs, referenceZAbs);
+            const ImU32 xAxisColor = axisColorFromCloseness(xCloseness);
+            const ImU32 zAxisColor = axisColorFromCloseness(zCloseness);
+
+            float x = panelMin.x + padX;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), estimatedCoordColor, prefix.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, prefix.c_str()).x;
+
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), xAxisColor, xText.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, xText.c_str()).x;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), lineColor, coordSep.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, coordSep.c_str()).x;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), zAxisColor, zText.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, zText.c_str()).x;
+
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), estimatedMetaColor, deltaXPrefix.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, deltaXPrefix.c_str()).x;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), xAxisColor, dxText.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, dxText.c_str()).x;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), estimatedMetaColor, deltaZPrefix.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, deltaZPrefix.c_str()).x;
+            drawList->AddText(font, fontSize, ImVec2(x, currentY), zAxisColor, dzText.c_str());
+
+            currentY += lineAdvance * (fontSize / lineFontSize);
+            const float barY = currentY;
+            drawAxisBar(panelMin.x + padX, barY, "X", xCloseness, xAxisColor, dxText);
+            drawAxisBar(panelMin.x + padX + axisBarWidth + axisBarSpacingX, barY, "Z", zCloseness, zAxisColor, dzText);
+            currentY += axisLegendFontSize + axisBarLegendGap + axisBarHeight + axisBarAfterGap;
+        };
+
+        if (snap.usingNetherCoords) {
+            drawCoordRow(targetNetherPrefix, targetNetherXText, targetNetherZText, emphasizedCoordFontSize, emphasizedCoordColor);
+            if (showEstimateValues) {
+                drawEstimatedCoordRow(estimatedNetherPrefix, snap.estimatedNetherX, snap.estimatedNetherZ, snap.targetNetherX,
+                                      snap.targetNetherZ, snap.playerNetherX, snap.playerNetherZ, estimatedCoordFontSize);
+            }
+            drawCoordRow(playerNetherPrefix, playerNetherXText, playerNetherZText, lineFontSize, lineColor);
+            drawCoordRow(targetOverworldPrefix, targetOverworldXText, targetOverworldZText, lineFontSize, lineColor);
+            if (showEstimateValues) {
+                drawEstimatedCoordRow(estimatedOverworldPrefix, snap.estimatedOverworldX, snap.estimatedOverworldZ, snap.targetOverworldX,
+                                      snap.targetOverworldZ, snap.playerOverworldX, snap.playerOverworldZ, estimatedCoordFontSize);
+            }
+            drawCoordRow(playerOverworldPrefix, playerOverworldXText, playerOverworldZText, lineFontSize, lineColor);
+        } else {
+            drawCoordRow(targetOverworldPrefix, targetOverworldXText, targetOverworldZText, emphasizedCoordFontSize, emphasizedCoordColor);
+            if (showEstimateValues) {
+                drawEstimatedCoordRow(estimatedOverworldPrefix, snap.estimatedOverworldX, snap.estimatedOverworldZ, snap.targetOverworldX,
+                                      snap.targetOverworldZ, snap.playerOverworldX, snap.playerOverworldZ, estimatedCoordFontSize);
+            }
+            drawCoordRow(playerOverworldPrefix, playerOverworldXText, playerOverworldZText, lineFontSize, lineColor);
+            drawCoordRow(targetNetherPrefix, targetNetherXText, targetNetherZText, lineFontSize, lineColor);
+            if (showEstimateValues) {
+                drawEstimatedCoordRow(estimatedNetherPrefix, snap.estimatedNetherX, snap.estimatedNetherZ, snap.targetNetherX,
+                                      snap.targetNetherZ, snap.playerNetherX, snap.playerNetherZ, estimatedCoordFontSize);
+            }
+            drawCoordRow(playerNetherPrefix, playerNetherXText, playerNetherZText, lineFontSize, lineColor);
+        }
+    }
+
+    const bool hasStatusCertainty = snap.hasTopCertainty || snap.hasCombinedCertainty;
+    const float statusCertaintyPercent = snap.hasTopCertainty ? snap.topCertaintyPercent
+                                                              : (snap.hasCombinedCertainty ? snap.combinedCertaintyPercent : 50.0f);
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string& line = lines[i];
+        ImU32 currentColor = lineColor;
+        bool isBoatLine = false;
+        if (boatLineIndex >= 0 && static_cast<int>(i) == boatLineIndex) {
+            currentColor = mutedColor;
+            isBoatLine = true;
+        } else if (warningLineIndex >= 0 && static_cast<int>(i) == warningLineIndex) {
+            currentColor = warningColor;
+        }
+        std::string displayLine = line;
+        float lineX = panelMin.x + padX;
+        if (isBoatLine) {
+            const float iconSize = std::max(10.0f, lineFontSize * 0.96f);
+            DrawStrongholdStatusIconImGui(drawList, ImVec2(lineX + iconSize * 0.56f, currentY + lineFontSize * 0.56f), iconSize,
+                                          snap.boatModeEnabled, snap.boatState, hasStatusCertainty, statusCertaintyPercent, boatBlueColor,
+                                          boatGreenColor, boatRedColor, mutedColor);
+            lineX += iconSize + (4.0f * uiScale);
+            (void)lineX;
+            displayLine.clear();
+        }
+        if (!displayLine.empty()) { drawList->AddText(font, lineFontSize, ImVec2(lineX, currentY), currentColor, displayLine.c_str()); }
+        currentY += lineAdvance;
+    }
 }
 
 // RENDER THREAD SHADER PROGRAMS
@@ -3147,9 +4335,13 @@ static void RenderThreadFunc(void* gameGLContext) {
                 RT_CollectActiveElements(cfg, request.modeId, false, activeMirrors, activeImages, activeWindowOverlayIds);
             }
 
+            StrongholdOverlayRenderSnapshot strongholdOverlaySnap = GetStrongholdOverlayRenderSnapshot();
+            bool shouldRenderStrongholdOverlay = strongholdOverlaySnap.enabled && strongholdOverlaySnap.visible &&
+                                                RT_ShouldRenderStrongholdOverlayOnCurrentMonitor(strongholdOverlaySnap);
+
             // Check if we need to render any ImGui content
             bool shouldRenderAnyImGui = request.shouldRenderGui || request.showPerformanceOverlay || request.showProfiler ||
-                                        request.showEyeZoom || request.showTextureGrid;
+                                        request.showEyeZoom || request.showTextureGrid || shouldRenderStrongholdOverlay;
 
             // Lazy-init ImGui the first time we actually need to render it.
             // Some systems can start the render thread before a valid HWND is published,
@@ -3478,6 +4670,10 @@ static void RenderThreadFunc(void* gameGLContext) {
                             drawList->AddText(font, fontSize, textPos, textColor, text.c_str());
                         }
                     }
+                }
+
+                if (shouldRenderStrongholdOverlay) {
+                    RT_RenderStrongholdOverlayImGui(strongholdOverlaySnap, request.shouldRenderGui);
                 }
 
                 // Render texture grid labels

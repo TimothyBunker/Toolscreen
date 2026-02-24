@@ -224,6 +224,7 @@ constexpr DWORD KEY_REBIND_CUSTOM_OUTPUT_SCANCODE = 0;
 // KeyRebindsConfig Defaults
 // ============================================================================
 constexpr bool KEY_REBINDS_ENABLED = false;
+constexpr bool KEY_REBINDS_GLOBAL_ONLY_IN_WORLD = true;
 
 // ============================================================================
 // Config (Global) Defaults
@@ -240,8 +241,8 @@ constexpr bool CONFIG_HIDE_ANIMATIONS_IN_GAME = false;
 constexpr int CONFIG_KEY_REPEAT_START_DELAY = 0;
 constexpr int CONFIG_KEY_REPEAT_DELAY = 0;
 constexpr bool CONFIG_BASIC_MODE_ENABLED = false;
-constexpr bool CONFIG_DISABLE_FULLSCREEN_PROMPT = false;
-constexpr bool CONFIG_DISABLE_CONFIGURE_PROMPT = false;
+constexpr bool CONFIG_DISABLE_FULLSCREEN_PROMPT = true;
+constexpr bool CONFIG_DISABLE_CONFIGURE_PROMPT = true;
 inline const std::string CONFIG_MIRROR_MATCH_COLORSPACE = "Auto";
 
 // Default GUI hotkey: LCtrl+I

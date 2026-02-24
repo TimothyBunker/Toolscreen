@@ -76,5 +76,8 @@ InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
 // Handle WM_CHAR key rebinding
 InputHandlerResult HandleCharRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
+// Runtime macro engine status (Ctrl+Shift+M toggle).
+bool AreMacrosRuntimeEnabled();
+
 // The refactored SubclassedWndProc that delegates to the handlers above
 LRESULT CALLBACK SubclassedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);

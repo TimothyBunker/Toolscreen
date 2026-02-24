@@ -8,8 +8,8 @@ fpsLimitSleepThreshold = 1000
 mirrorMatchColorspace = 'Auto'
 guiHotkey = [ 162, 73 ]
 hideAnimationsInGame = true
-disableFullscreenPrompt = false
-disableConfigurePrompt = false
+disableFullscreenPrompt = true
+disableConfigurePrompt = true
 keyRepeatDelay = 0
 keyRepeatStartDelay = 0
 mouseSensitivity = 1.0
@@ -75,32 +75,35 @@ windowWidth = 384
 
 [keyRebinds]
 enabled = true
-rebinds = [ { fromKey = 18, toKey = 114, enabled = true, useCustomOutput = false, customOutputVK = 0, customOutputScanCode = 0 } ]
+globalOnlyInWorld = true
+rebinds = [ { fromKey = 9, toKey = 114, enabled = true, onlyInWorld = true, useCustomOutput = false, customOutputVK = 0, customOutputScanCode = 0 } ]
 
-[[windowOverlay]]
-name = 'Stronghold Arrow Overlay'
-windowTitle = 'Stronghold Arrow Overlay'
-windowClass = ''
-executableName = ''
-windowMatchPriority = 'title'
+[strongholdOverlay]
+enabled = true
+visible = false
+autoHideOnEyeSpy = true
+nonMcsrFeaturesEnabled = false
+showDirectionArrow = true
+showEstimateValues = true
+showAlignmentText = true
+hudLayoutMode = 2
+preferNetherCoords = true
+autoLockOnFirstNether = true
+useChunkCenterTarget = false
+standaloneClipboardMode = true
+standaloneAllowNonBoatThrows = true
+manageNinjabrainBotProcess = false
+autoStartNinjabrainBot = false
+hideNinjabrainBotWindow = false
+ninjabrainBotJarPath = ''
+renderMonitorMode = 0
+renderMonitorMask = -1
 x = 0
-y = 0
+y = 20
 scale = 1.0
-relativeTo = 'topLeftScreen'
-crop_top = 0
-crop_bottom = 0
-crop_left = 0
-crop_right = 0
-enableColorKey = true
-colorKeys = [ { color = [ 0, 255, 0 ], sensitivity = 0.05 } ]
 opacity = 1.0
-background = { enabled = false, color = [ 0, 0, 0 ], opacity = 0.0 }
-pixelatedScaling = false
-onlyOnMyScreen = false
-fps = 30
-captureMethod = 'Windows 10+'
-enableInteraction = false
-border = { enabled = false, color = [ 255, 255, 255 ], width = 4, radius = 0 }
+backgroundOpacity = 0.55
+pollIntervalMs = 125
 
 [[hotkey]]
 altSecondaryModes = []
@@ -325,7 +328,7 @@ sensitivityOverrideEnabled = false
 separateXYSensitivity = false
 stretch = { enabled = true, height = 1440, width = 2560, x = 0, y = 0 }
 width = 2560
-windowOverlayIds = [ 'Stronghold Arrow Overlay' ]
+windowOverlayIds = []
 
     [mode.transition]
     gameTransition = 'Bounce'
@@ -366,7 +369,7 @@ sensitivityOverrideEnabled = false
 separateXYSensitivity = false
 stretch = { enabled = false, height = 0, width = 0, x = 0, y = 0 }
 width = 384
-windowOverlayIds = [ 'Stronghold Arrow Overlay' ]
+windowOverlayIds = []
 
     [mode.transition]
     gameTransition = 'Bounce'
@@ -407,7 +410,7 @@ sensitivityOverrideEnabled = false
 separateXYSensitivity = false
 stretch = { enabled = false, height = 0, width = 0, x = 0, y = 0 }
 width = 'max(330, roundEven(screenWidth / 8))'
-windowOverlayIds = [ 'Stronghold Arrow Overlay' ]
+windowOverlayIds = []
 
     [mode.transition]
     gameTransition = 'Bounce'
@@ -448,7 +451,7 @@ sensitivityOverrideEnabled = false
 separateXYSensitivity = false
 stretch = { enabled = false, height = 0, width = 0, x = 0, y = 0 }
 width = "roundEven(screenWidth * 0.98)"
-windowOverlayIds = [ 'Stronghold Arrow Overlay' ]
+windowOverlayIds = []
 
     [mode.transition]
     gameTransition = 'Bounce'

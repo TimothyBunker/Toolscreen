@@ -1,4 +1,4 @@
-﻿if (ImGui::BeginTabItem("Images")) {
+﻿if (ImGui::BeginTabItem("[I] Images")) {
     g_currentlyEditingMirror = "";
 
     // Enable image drag mode when Images tab is active
@@ -7,8 +7,7 @@
     g_windowOverlayDragMode.store(false);
 
     // Show instructions
-    ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f),
-                       "You can click and drag images in the game window to move them while this tab is open");
+    ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "[Drag] Move images directly in game while this tab is open.");
     ImGui::Separator();
 
     int image_to_remove = -1;

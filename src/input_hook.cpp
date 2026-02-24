@@ -52,6 +52,31 @@ extern std::mutex g_triggerOnReleaseMutex;
 // Forward declaration for ImGui handler
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
+namespace {
+
+std::atomic<bool> g_macrosEnabledRuntime = true;
+
+bool IsInWorldGameState(const std::string& gameState) { return gameState.find("inworld") != std::string::npos; }
+
+void ClearTriggerOnReleaseState() {
+    std::lock_guard<std::mutex> lock(g_triggerOnReleaseMutex);
+    g_triggerOnReleasePending.clear();
+    g_triggerOnReleaseInvalidated.clear();
+}
+
+bool IsMacroMasterToggleHotkeyPressed(UINT uMsg, DWORD vkCode, LPARAM lParam) {
+    if (uMsg != WM_KEYDOWN && uMsg != WM_SYSKEYDOWN) return false;
+    if (vkCode != 'M') return false;
+    // Ignore repeats to avoid oscillating the toggle while key is held.
+    if ((lParam & (1LL << 30)) != 0) return false;
+
+    const bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    return ctrlDown && shiftDown;
+}
+
+} // namespace
+
 InputHandlerResult HandleMouseMoveViewportOffset(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM& lParam) {
     PROFILE_SCOPE("HandleMouseMoveViewportOffset");
 
@@ -327,6 +352,93 @@ InputHandlerResult HandleGuiToggle(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     return { true, 1 };
 }
 
+InputHandlerResult HandleStrongholdOverlayHotkey(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    PROFILE_SCOPE("HandleStrongholdOverlayHotkey");
+    (void)hWnd;
+
+    if (uMsg != WM_KEYDOWN && uMsg != WM_SYSKEYDOWN) { return { false, 0 }; }
+
+    // Support numpad controls even when NumLock is OFF (VK_UP/DOWN/LEFT/RIGHT/CLEAR)
+    // by accepting non-extended arrow-family keys and mapping them to numpad VKeys.
+    int mappedNumpadHotkey = 0;
+    if (wParam == VK_NUMPAD8 || wParam == VK_NUMPAD2 || wParam == VK_NUMPAD5 || wParam == VK_NUMPAD4 || wParam == VK_NUMPAD6) {
+        mappedNumpadHotkey = static_cast<int>(wParam);
+    } else if ((lParam & (1LL << 24)) == 0) {
+        switch (wParam) {
+        case VK_UP:
+            mappedNumpadHotkey = VK_NUMPAD8;
+            break;
+        case VK_DOWN:
+            mappedNumpadHotkey = VK_NUMPAD2;
+            break;
+        case VK_LEFT:
+            mappedNumpadHotkey = VK_NUMPAD4;
+            break;
+        case VK_RIGHT:
+            mappedNumpadHotkey = VK_NUMPAD6;
+            break;
+        case VK_CLEAR:
+            mappedNumpadHotkey = VK_NUMPAD5;
+            break;
+        default:
+            break;
+        }
+    }
+
+    const bool isPanelHotkey = (wParam == 'H' || wParam == 0x48);
+    const bool isNumpadHotkey = mappedNumpadHotkey != 0;
+    if (!isPanelHotkey && !isNumpadHotkey) { return { false, 0 }; }
+
+    // Ignore key-repeat events so one key hold doesn't toggle multiple times.
+    if ((lParam & (1LL << 30)) != 0) { return { true, 1 }; }
+
+    if (isNumpadHotkey) {
+        if (!HandleStrongholdOverlayNumpadHotkey(mappedNumpadHotkey)) { return { false, 0 }; }
+        return { true, 1 };
+    }
+
+    bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (!HandleStrongholdOverlayHotkeyH(shiftDown, ctrlDown)) { return { false, 0 }; }
+    return { true, 1 };
+}
+
+static bool IsAltFamilyKey(DWORD vk) { return vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU; }
+
+static bool HasAltSourceRebindEnabled() {
+    auto cfgSnap = GetConfigSnapshot();
+    if (!cfgSnap || !cfgSnap->keyRebinds.enabled) return false;
+    for (const auto& rebind : cfgSnap->keyRebinds.rebinds) {
+        if (!rebind.enabled) continue;
+        if (IsAltFamilyKey(rebind.fromKey)) return true;
+    }
+    return false;
+}
+
+InputHandlerResult HandleAltEsc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    PROFILE_SCOPE("HandleAltEsc");
+    (void)hWnd;
+    (void)lParam;
+
+    // Alt+Esc can switch tasks unexpectedly when Alt is used as an F3 rebind source.
+    // Handle both key-message and system-command paths.
+    if (!HasAltSourceRebindEnabled()) { return { false, 0 }; }
+
+    const bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    if (!altDown) { return { false, 0 }; }
+
+    if ((uMsg == WM_SYSKEYDOWN || uMsg == WM_SYSKEYUP || uMsg == WM_KEYDOWN || uMsg == WM_KEYUP) && wParam == VK_ESCAPE) {
+        return { true, 1 };
+    }
+
+    if (uMsg == WM_SYSCOMMAND) {
+        const UINT command = static_cast<UINT>(wParam & 0xFFF0u);
+        if (command == SC_NEXTWINDOW || command == SC_PREVWINDOW) { return { true, 0 }; }
+    }
+
+    return { false, 0 };
+}
+
 InputHandlerResult HandleWindowOverlayKeyboard(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     PROFILE_SCOPE("HandleWindowOverlayKeyboard");
 
@@ -466,6 +578,7 @@ InputHandlerResult HandleActivate(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
         extern std::atomic<bool> g_isGameFocused;
         g_isGameFocused.store(false);
         g_gameWindowActive.store(false);
+        ResetStrongholdLiveInputState();
 
         RestoreWindowsMouseSpeed();
         RestoreKeyRepeatSettings();
@@ -499,6 +612,11 @@ InputHandlerResult HandleActivate(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
 InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, const std::string& currentModeId,
                                  const std::string& gameState) {
     PROFILE_SCOPE("HandleHotkeys");
+
+    if (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN || uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP) {
+        const bool isDown = (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN);
+        ReportStrongholdLiveKeyState(static_cast<int>(wParam), isDown);
+    }
 
     // Determine the virtual key code based on message type
     DWORD vkCode = 0;
@@ -541,6 +659,15 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
         return { false, 0 };
     }
 
+    // Runtime kill-switch for all macro processing (mode hotkeys, sensitivity hotkeys, key rebinds).
+    if (IsMacroMasterToggleHotkeyPressed(uMsg, vkCode, lParam)) {
+        const bool newState = !g_macrosEnabledRuntime.load(std::memory_order_relaxed);
+        g_macrosEnabledRuntime.store(newState, std::memory_order_relaxed);
+        if (!newState) ClearTriggerOnReleaseState();
+        Log(std::string("[MACRO] Global macros ") + (newState ? "enabled" : "disabled") + " (Ctrl+Shift+M)");
+        return { true, 1 };
+    }
+
     if (!IsResolutionChangeSupported(g_gameVersion)) { return { true, CallWindowProc(g_originalWndProc, hWnd, uMsg, wParam, lParam) }; }
 
     // Lock-free check of hotkey main keys - acceptable to race (worst case: miss one keypress)
@@ -560,6 +687,18 @@ InputHandlerResult HandleHotkeys(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
     const Config& cfg = *cfgSnap;
 
     bool s_enableHotkeyDebug = cfg.debug.showHotkeyDebug;
+    const bool isInWorldState = IsInWorldGameState(gameState);
+    const bool macrosDisabledByHotkey = !g_macrosEnabledRuntime.load(std::memory_order_relaxed);
+    const bool macrosDisabledByState = cfg.keyRebinds.globalOnlyInWorld && !isInWorldState;
+
+    if (macrosDisabledByHotkey || macrosDisabledByState) {
+        if (macrosDisabledByState) ClearTriggerOnReleaseState();
+        if (s_enableHotkeyDebug) {
+            Log(std::string("[Hotkey] Macro processing skipped: ") +
+                (macrosDisabledByHotkey ? "runtime-disabled" : "not in-world state"));
+        }
+        return { false, 0 };
+    }
 
     if (s_enableHotkeyDebug) { Log("[Hotkey] Key/button pressed: " + std::to_string(vkCode) + " in mode: " + currentModeId); }
     if (s_enableHotkeyDebug) {
@@ -949,6 +1088,11 @@ static bool RebindKeyMatchesInput(DWORD inputVkCode, DWORD configuredFromKey, bo
     return false;
 }
 
+static bool IsInWorldStateForRebinds() {
+    const std::string localGameState = g_gameStateBuffers[g_currentGameStateIndex.load(std::memory_order_acquire)];
+    return IsInWorldGameState(localGameState);
+}
+
 InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     PROFILE_SCOPE("HandleKeyRebinding");
 
@@ -1004,9 +1148,13 @@ InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
     // Use config snapshot for thread-safe access to key rebinds
     auto rebindCfg = GetConfigSnapshot();
     if (!rebindCfg || !rebindCfg->keyRebinds.enabled) { return { false, 0 }; }
+    if (!g_macrosEnabledRuntime.load(std::memory_order_relaxed)) { return { false, 0 }; }
+    const bool isInWorldState = IsInWorldStateForRebinds();
+    if (rebindCfg->keyRebinds.globalOnlyInWorld && !isInWorldState) { return { false, 0 }; }
 
     for (size_t i = 0; i < rebindCfg->keyRebinds.rebinds.size(); ++i) {
         const auto& rebind = rebindCfg->keyRebinds.rebinds[i];
+        if (rebind.onlyInWorld && !isInWorldState) { continue; }
 
         if (rebind.enabled && rebind.fromKey != 0 && rebind.toKey != 0 && RebindKeyMatchesInput(vkCode, rebind.fromKey, isKeyDown)) {
             DWORD outputVK;
@@ -1044,7 +1192,8 @@ InputHandlerResult HandleKeyRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
             }
 
             // For keyboard output from keyboard/mouse input
-            const bool isSystemKeyMsg = (uMsg == WM_SYSKEYDOWN || uMsg == WM_SYSKEYUP);
+            const bool sourceIsAltFamily = IsAltFamilyKey(vkCode) || IsAltFamilyKey(rebind.fromKey);
+            const bool isSystemKeyMsg = (uMsg == WM_SYSKEYDOWN || uMsg == WM_SYSKEYUP) && !sourceIsAltFamily;
             UINT outputMsg = isKeyDown ? (isSystemKeyMsg ? WM_SYSKEYDOWN : WM_KEYDOWN) : (isSystemKeyMsg ? WM_SYSKEYUP : WM_KEYUP);
 
             UINT repeatCount = 1;
@@ -1072,10 +1221,14 @@ InputHandlerResult HandleCharRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 
     auto charRebindCfg = GetConfigSnapshot();
     if (uMsg != WM_CHAR || !charRebindCfg || !charRebindCfg->keyRebinds.enabled) { return { false, 0 }; }
+    if (!g_macrosEnabledRuntime.load(std::memory_order_relaxed)) { return { false, 0 }; }
+    const bool isInWorldState = IsInWorldStateForRebinds();
+    if (charRebindCfg->keyRebinds.globalOnlyInWorld && !isInWorldState) { return { false, 0 }; }
 
     WCHAR inputChar = static_cast<WCHAR>(wParam);
 
     for (const auto& rebind : charRebindCfg->keyRebinds.rebinds) {
+        if (rebind.onlyInWorld && !isInWorldState) continue;
         if (!rebind.enabled || rebind.fromKey == 0 || rebind.toKey == 0) continue;
 
         WCHAR fromUnshifted = 0;
@@ -1112,6 +1265,8 @@ InputHandlerResult HandleCharRebinding(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
     return { false, 0 };
 }
 
+bool AreMacrosRuntimeEnabled() { return g_macrosEnabledRuntime.load(std::memory_order_relaxed); }
+
 LRESULT CALLBACK SubclassedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     PROFILE_SCOPE("SubclassedWndProc");
 
@@ -1145,6 +1300,10 @@ LRESULT CALLBACK SubclassedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     result = HandleWindowValidation(hWnd, uMsg, wParam, lParam);
     if (result.consumed) return result.result;
 
+    // Keep stronghold panel controls responsive even if Minecraft temporarily exits fullscreen.
+    result = HandleStrongholdOverlayHotkey(hWnd, uMsg, wParam, lParam);
+    if (result.consumed) return result.result;
+
     result = HandleNonFullscreenCheck(hWnd, uMsg, wParam, lParam);
     if (result.consumed) return result.result;
 
@@ -1156,6 +1315,9 @@ LRESULT CALLBACK SubclassedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     if (result.consumed) return result.result;
 
     result = HandleAltF4(hWnd, uMsg, wParam, lParam);
+    if (result.consumed) return result.result;
+
+    result = HandleAltEsc(hWnd, uMsg, wParam, lParam);
     if (result.consumed) return result.result;
 
     result = HandleConfigLoadFailure(hWnd, uMsg, wParam, lParam);

@@ -417,6 +417,7 @@ struct KeyRebind {
     DWORD fromKey = 0; // Original key to intercept
     DWORD toKey = 0;   // Key to send instead (virtual key code)
     bool enabled = true;
+    bool onlyInWorld = false; // If true, this rebind only fires while gameState contains "inworld"
 
     // Optional: Custom output settings (when useCustomOutput is true)
     bool useCustomOutput = false;   // If true, use custom VK/scancode instead of auto-calculated
@@ -425,7 +426,35 @@ struct KeyRebind {
 };
 struct KeyRebindsConfig {
     bool enabled = false; // Master switch for all rebinds
+    bool globalOnlyInWorld = true; // If true, all macro-style inputs only fire while gameState contains "inworld"
     std::vector<KeyRebind> rebinds;
+};
+struct StrongholdOverlayConfig {
+    bool enabled = true;                 // Master toggle for native stronghold overlay
+    bool visible = false;                // Runtime startup visibility (hidden by default)
+    bool autoHideOnEyeSpy = true;        // Auto-hide panel after Eye Spy advancement appears in Minecraft latest.log
+    bool nonMcsrFeaturesEnabled = false; // Master toggle for non-approved MCSR visual helpers
+    bool showDirectionArrow = true;      // Show/hide large direction arrow glyph
+    bool showEstimateValues = true;      // Show/hide estimated/offset values (Aim/Off/Err)
+    bool showAlignmentText = true;       // Show/hide Align/Aim percentage text
+    int hudLayoutMode = 2;               // 0=full, 2=speedrun (1=legacy compact alias -> speedrun)
+    bool preferNetherCoords = true;      // Show nether-scaled coordinates by default
+    bool autoLockOnFirstNether = true;   // Auto-lock once after entering nether/boat throw
+    bool useChunkCenterTarget = false;   // False = chunk corner (matches NBB display)
+    bool standaloneClipboardMode = true; // Read F3+C clipboard directly in Toolscreen (no NBB process/API required)
+    bool standaloneAllowNonBoatThrows = true; // Default OFF boat-eye: use normal eye throws (1-2 eye method)
+    bool manageNinjabrainBotProcess = false; // Standalone-only release default
+    bool autoStartNinjabrainBot = false;     // Standalone-only release default
+    bool hideNinjabrainBotWindow = false;    // Standalone-only release default
+    std::string ninjabrainBotJarPath;       // Optional path to Ninjabrain-Bot jar (absolute or relative to toolscreen dir)
+    int renderMonitorMode = 0;              // 0=all monitors, 1=selected monitor(s)
+    unsigned long long renderMonitorMask = ~0ull; // Bitmask of selected monitors when mode=selected
+    int x = 0;                           // Overlay X offset from top-center screen
+    int y = 20;                          // Overlay Y offset from top edge
+    float scale = 1.0f;                  // UI scale multiplier
+    float opacity = 1.0f;                // Text/border opacity multiplier
+    float backgroundOpacity = 0.55f;     // Panel background alpha multiplier
+    int pollIntervalMs = 125;            // API polling interval
 };
 struct Config {
     int configVersion = 1; // Config version for automatic upgrades
@@ -451,12 +480,13 @@ struct Config {
     int windowsMouseSpeed = 0;                              // Windows mouse speed override (0 = disabled, 1-20 = override)
     bool hideAnimationsInGame = false;                      // Show transition animations only on OBS, not in-game
     KeyRebindsConfig keyRebinds;                            // Key rebinding configuration
+    StrongholdOverlayConfig strongholdOverlay;              // Native stronghold direction overlay
     AppearanceConfig appearance;                            // GUI color scheme configuration
     int keyRepeatStartDelay = 0;                            // Key repeat start delay (0 = disabled, 1-500ms = custom)
     int keyRepeatDelay = 0;                                 // Key repeat delay between repeats (0 = disabled, 1-500ms = custom)
     bool basicModeEnabled = false;                          // true = Basic mode GUI, false = Advanced mode GUI (default)
-    bool disableFullscreenPrompt = false;                   // Disable fullscreen toast prompt (toast2)
-    bool disableConfigurePrompt = false;                    // Disable configure toast prompt (toast1)
+    bool disableFullscreenPrompt = true;                    // Disable fullscreen toast prompt (toast2)
+    bool disableConfigurePrompt = true;                     // Disable configure toast prompt (toast1)
 };
 struct GameViewportGeometry {
     int gameW = 0, gameH = 0;

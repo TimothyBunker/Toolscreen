@@ -1,9 +1,9 @@
-if (ImGui::BeginTabItem("Settings")) {
+if (ImGui::BeginTabItem("[S] Settings")) {
     g_currentlyEditingMirror = "";
     g_imageDragMode.store(false);
     g_windowOverlayDragMode.store(false);
 
-    ImGui::SeparatorText("Performance");
+    ImGui::SeparatorText("[P] Performance");
 
     ImGui::Text("FPS Limit:");
     ImGui::SetNextItemWidth(600);
@@ -21,8 +21,8 @@ if (ImGui::BeginTabItem("Settings")) {
                "Lower FPS can reduce GPU load and power consumption.");
 
     ImGui::Spacing();
-    ImGui::SeparatorText("Capture/Streaming");
-    if (ImGui::Checkbox("Hide animations in game", &g_config.hideAnimationsInGame)) { g_configIsDirty = true; }
+    ImGui::SeparatorText("[C] Capture");
+    if (ImGui::Checkbox("Hide In-Game Animations", &g_config.hideAnimationsInGame)) { g_configIsDirty = true; }
     ImGui::SameLine();
     HelpMarker("When enabled, mode transitions appear instant on your screen,\n"
                "but OBS Game Capture will show the animations.");
@@ -37,7 +37,7 @@ if (ImGui::BeginTabItem("Settings")) {
     HelpMarker("Disables the configure toast prompt (toast1) shown in windowed mode.");*/
 
     ImGui::Spacing();
-    ImGui::SeparatorText("Mirrors");
+    ImGui::SeparatorText("[R] Mirrors");
     {
         const char* gammaModes[] = { "Auto", "Assume sRGB", "Assume Linear" };
         int gm = static_cast<int>(g_config.mirrorGammaMode);

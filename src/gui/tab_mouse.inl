@@ -1,4 +1,4 @@
-            if (ImGui::BeginTabItem("Mouse")) {
+            if (ImGui::BeginTabItem("[M] Mouse")) {
                 g_currentlyEditingMirror = "";
                 g_imageDragMode.store(false);
                 g_windowOverlayDragMode.store(false);

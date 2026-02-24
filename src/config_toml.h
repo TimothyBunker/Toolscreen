@@ -37,6 +37,7 @@ struct CursorsConfig;
 struct EyeZoomConfig;
 struct KeyRebind;
 struct KeyRebindsConfig;
+struct StrongholdOverlayConfig;
 struct AppearanceConfig;
 struct Config;
 
@@ -69,6 +70,7 @@ void CursorsConfigToToml(const CursorsConfig& cfg, toml::table& out);
 void EyeZoomConfigToToml(const EyeZoomConfig& cfg, toml::table& out);
 void KeyRebindToToml(const KeyRebind& cfg, toml::table& out);
 void KeyRebindsConfigToToml(const KeyRebindsConfig& cfg, toml::table& out);
+void StrongholdOverlayConfigToToml(const StrongholdOverlayConfig& cfg, toml::table& out);
 void AppearanceConfigToToml(const AppearanceConfig& cfg, toml::table& out);
 void ConfigToToml(const Config& config, toml::table& out);
 
@@ -100,6 +102,7 @@ void CursorsConfigFromToml(const toml::table& tbl, CursorsConfig& cfg);
 void EyeZoomConfigFromToml(const toml::table& tbl, EyeZoomConfig& cfg);
 void KeyRebindFromToml(const toml::table& tbl, KeyRebind& cfg);
 void KeyRebindsConfigFromToml(const toml::table& tbl, KeyRebindsConfig& cfg);
+void StrongholdOverlayConfigFromToml(const toml::table& tbl, StrongholdOverlayConfig& cfg);
 void AppearanceConfigFromToml(const toml::table& tbl, AppearanceConfig& cfg);
 void ConfigFromToml(const toml::table& tbl, Config& config);
 

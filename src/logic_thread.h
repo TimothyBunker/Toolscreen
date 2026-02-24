@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <string>
+#include <vector>
 
 // Thread runs independently at ~60Hz, handling logic checks that don't require the GL context
 // This offloads work from the game's render thread (SwapBuffers hook)
@@ -23,6 +24,71 @@ struct CachedModeViewport {
 // Logic thread writes, game thread (hkglViewport) reads
 extern CachedModeViewport g_viewportModeCache[2];
 extern std::atomic<int> g_viewportModeCacheIndex;
+
+struct StrongholdOverlayRenderSnapshot {
+    bool enabled = false;
+    bool visible = false;
+    bool apiOnline = false;
+    bool hasPlayerSnapshot = false;
+    bool hasPrediction = false;
+    bool targetLocked = false;
+    bool lockWasAuto = false;
+    bool blockAutoLockUntilThrowClear = false;
+    bool showDirectionArrow = true;
+    bool showEstimateValues = true;
+    bool showAlignmentText = true;
+    bool boatModeEnabled = true;
+    bool preferNetherCoords = true;
+    bool usingNetherCoords = true;
+    bool usingLiveTarget = true;
+    bool mcsrSafeMode = false;
+    int hudLayoutMode = 2; // 0=full, 2=speedrun (1=legacy compact alias -> speedrun)
+    int renderMonitorMode = 0; // 0=all monitors, 1=selected monitor(s)
+    unsigned long long renderMonitorMask = ~0ull;
+    float overlayOpacity = 1.0f;
+    float backgroundOpacity = 0.55f;
+    float scale = 1.0f;
+    int x = 24;
+    int y = 24;
+    int targetDisplayX = 0;
+    int targetDisplayZ = 0;
+    int playerDisplayX = 0;
+    int playerDisplayZ = 0;
+    int targetNetherX = 0;
+    int targetNetherZ = 0;
+    int estimatedNetherX = 0;
+    int estimatedNetherZ = 0;
+    int playerNetherX = 0;
+    int playerNetherZ = 0;
+    int targetOverworldX = 0;
+    int targetOverworldZ = 0;
+    int estimatedOverworldX = 0;
+    int estimatedOverworldZ = 0;
+    int playerOverworldX = 0;
+    int playerOverworldZ = 0;
+    float distanceDisplay = 0.0f;
+    float relativeYaw = 0.0f;
+    int activeEyeThrowCount = 0;
+    float angleAdjustmentDeg = 0.0f;
+    float angleAdjustmentStepDeg = 0.01f;
+    int lastAdjustmentStepDirection = 0; // -1 red, +1 green, 0 none
+    bool hasTopCertainty = false;
+    float topCertaintyPercent = 0.0f;
+    bool hasCombinedCertainty = false;
+    float combinedCertaintyPercent = 0.0f;
+    bool hasNextThrowDirection = false;
+    int moveLeftBlocks = 0;
+    int moveRightBlocks = 0;
+    std::string topCandidate1Label;
+    std::string topCandidate2Label;
+    std::string warningLabel;
+    int boatState = 0; // 0=uninitialized(blue), 1=good(green), 2=failed(red)
+    std::string boatLabel = "Boat: UNINIT";
+    std::string modeLabel = "nether";
+    std::string statusLabel = "LIVE/UNLOCKED";
+    std::string infoLabel = "No throws yet. Shift+H lock";
+    bool showComputedDetails = false;
+};
 
 // Update the cached viewport mode data (called by logic_thread when mode changes)
 void UpdateCachedViewportMode();
@@ -69,3 +135,29 @@ int GetCachedScreenHeight();
 // Marks cached screen metrics as dirty so the next refresh re-queries the monitor
 // the game window is currently on. Safe to call from any thread.
 void InvalidateCachedScreenMetrics();
+
+// ============================================================================
+// STRONGHOLD OVERLAY
+// ============================================================================
+
+// Called by logic thread to poll NinjaBrainBot API and update overlay state.
+void UpdateStrongholdOverlayState();
+
+// Snapshot for render thread drawing.
+StrongholdOverlayRenderSnapshot GetStrongholdOverlayRenderSnapshot();
+
+// Hotkey handlers (called from input hook).
+// Returns true when handled and should consume the key event.
+bool HandleStrongholdOverlayHotkeyH(bool shiftDown, bool ctrlDown);
+bool HandleStrongholdOverlayNumpadHotkey(int virtualKey);
+
+// Runtime environment detection helpers.
+// MCSR-safe mode is auto-detected from launcher/instance path hints.
+bool IsMcsrRankedInstanceDetected();
+std::string GetMcsrRankedDetectionSource();
+
+// Live input feed for continuous stronghold guidance between F3+C/API samples.
+// Called from raw-input/keyboard hooks.
+void ReportStrongholdLiveMouseDelta(int deltaX, int deltaY);
+void ReportStrongholdLiveKeyState(int virtualKey, bool isDown);
+void ResetStrongholdLiveInputState();

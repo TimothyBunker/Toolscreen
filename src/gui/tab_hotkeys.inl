@@ -1,23 +1,22 @@
 // Only show Hotkeys tab if resolution changing is supported (1.13+)
 if (IsResolutionChangeSupported(g_gameVersion)) {
-    if (ImGui::BeginTabItem("Hotkeys")) {
+    if (ImGui::BeginTabItem("[H] Hotkeys")) {
         g_currentlyEditingMirror = ""; // Disable image drag mode in other tabs
         g_imageDragMode.store(false);
         g_windowOverlayDragMode.store(false);
 
         if (!g_isStateOutputAvailable.load(std::memory_order_acquire)) {
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Warning: wpstateout.txt not found.");
-            ImGui::TextWrapped("State-based hotkey restrictions are currently disabled, so hotkeys will trigger regardless of required "
-                               "game states. Install the State Output mod to enable these conditions.");
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Warning: wpstateout.txt missing.");
+            ImGui::TextWrapped("State gates are disabled. Install State Output to restore state-gated hotkeys.");
             ImGui::Separator();
         }
 
         // GUI Hotkey Section
-        ImGui::SeparatorText("GUI Hotkey");
+        ImGui::SeparatorText("[G] GUI");
         ImGui::PushID("gui_hotkey");
         std::string guiKeyStr = GetKeyComboString(g_config.guiHotkey);
-        std::string guiNode_label = "Open/Close GUI: " + (guiKeyStr.empty() ? "[None]" : guiKeyStr);
+        std::string guiNode_label = "GUI Toggle: " + (guiKeyStr.empty() ? "[None]" : guiKeyStr);
 
         bool guiNode_open = ImGui::TreeNodeEx("##gui_hotkey_node", ImGuiTreeNodeFlags_SpanAvailWidth, "%s", guiNode_label.c_str());
         if (guiNode_open) {
@@ -32,13 +31,13 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
         }
         ImGui::PopID();
 
-        ImGui::SeparatorText("Mode Hotkeys");
+        ImGui::SeparatorText("[M] Mode Binds");
         int hotkey_to_remove = -1;
         for (size_t i = 0; i < g_config.hotkeys.size(); ++i) {
             auto& hotkey = g_config.hotkeys[i];
             ImGui::PushID((int)i);
             std::string keyStr = GetKeyComboString(hotkey.keys);
-            std::string node_label = "Hotkey: " + (keyStr.empty() ? "[None]" : keyStr);
+            std::string node_label = "Bind: " + (keyStr.empty() ? "[None]" : keyStr);
 
             // X button on the left
             if (ImGui::Button(("X##del_hotkey_" + std::to_string(i)).c_str(), ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight()))) {
@@ -70,7 +69,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                     s_exclusionToBind = { -1, -1 };
                 }
 
-                ImGui::SeparatorText("Target Mode");
+                ImGui::SeparatorText("Target");
                 ImGui::SetNextItemWidth(150);
                 const char* modeDisplay = hotkey.secondaryMode.empty() ? "[None]" : hotkey.secondaryMode.c_str();
                 if (ImGui::BeginCombo("Mode", modeDisplay)) {
@@ -102,7 +101,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                 ImGui::TextDisabled("(?)");
                 if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Pressing this hotkey toggles between Fullscreen and this mode"); }
 
-                ImGui::SeparatorText("Alternative Secondary Modes");
+                ImGui::SeparatorText("Alternates");
                 int alt_to_remove = -1;
                 for (size_t j = 0; j < hotkey.altSecondaryModes.size(); ++j) {
                     auto& alt = hotkey.altSecondaryModes[j];
@@ -152,7 +151,7 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                     hotkey.altSecondaryModes.erase(hotkey.altSecondaryModes.begin() + alt_to_remove);
                     g_configIsDirty = true;
                 }
-                if (ImGui::Button("Add Alternative Mode")) {
+                if (ImGui::Button("+ Alt Mode")) {
                     hotkey.altSecondaryModes.push_back(AltSecondaryMode{});
                     g_configIsDirty = true;
                 }
@@ -160,17 +159,17 @@ if (IsResolutionChangeSupported(g_gameVersion)) {
                 ImGui::Separator();
                 ImGui::Columns(2, "debounce_col", false);
                 ImGui::SetColumnWidth(0, 150);
-                ImGui::Text("Debounce (ms)");
+                ImGui::Text("Debounce");
                 ImGui::NextColumn();
                 if (Spinner("##debounce", &hotkey.debounce, 1, 0)) g_configIsDirty = true;
                 ImGui::Columns(1);
 
-                if (ImGui::Checkbox("Trigger on Release", &hotkey.triggerOnRelease)) { g_configIsDirty = true; }
+                if (ImGui::Checkbox("On Release", &hotkey.triggerOnRelease)) { g_configIsDirty = true; }
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("When checked, the hotkey triggers when the key is released instead of pressed");
                 }
 
-                if (ImGui::TreeNode("Required Game States")) {
+                if (ImGui::TreeNode("State Gate")) {
                     // Check if "Any" state is active (empty gameState array)
                     bool isAnySelected = hotkey.conditions.gameState.empty();
 

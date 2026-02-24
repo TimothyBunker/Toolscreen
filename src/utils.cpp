@@ -112,6 +112,7 @@ void SignalHandler(int sig) {
 }
 
 // Override abort() to log before terminating
+#ifndef TOOLSCREEN_DISABLE_ABORT_OVERRIDE
 extern "C" void abort() {
     // Prevent re-entry if abort is called recursively
     static std::atomic<bool> abortInProgress{ false };
@@ -176,6 +177,7 @@ extern "C" void abort() {
     // If raise returns (shouldn't happen), force terminate as fallback
     TerminateProcess(GetCurrentProcess(), 3);
 }
+#endif
 
 std::string GetTimestamp() {
     auto now = std::chrono::system_clock::now();

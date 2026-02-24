@@ -3,7 +3,14 @@
 !src
 !src/*.cpp
 !src/*.h
+!src/*.rc
 !src/gui/
 !src/gui/**
 !src/*.toml
 !src/*.png
+!CMakeLists.txt
+!CREDITS.md
+!third_party/
+!third_party/**
+!scripts/
+!scripts/**

@@ -1,0 +1,7 @@
+#include "resource.h"
+
+IDR_DEFAULT_CONFIG RCDATA "default.toml"
+IDR_TOAST1_PNG     RCDATA "toast1.png"
+IDR_TOAST2_PNG     RCDATA "toast2.png"
+IDR_STRONGHOLD_BOAT_PNG RCDATA "stronghold_boat.png"
+IDR_STRONGHOLD_EYE_PNG  RCDATA "stronghold_eye.png"

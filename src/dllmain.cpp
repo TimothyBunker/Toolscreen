@@ -964,6 +964,12 @@ UINT WINAPI hkGetRawInputData(HRAWINPUT hRawInput, UINT uiCommand, LPVOID pData,
                 raw->data.mouse.lLastY = outputY;
             }
         }
+
+        if (!(raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            const int liveDx = static_cast<int>(raw->data.mouse.lLastX);
+            const int liveDy = static_cast<int>(raw->data.mouse.lLastY);
+            if (liveDx != 0 || liveDy != 0) { ReportStrongholdLiveMouseDelta(liveDx, liveDy); }
+        }
     }
 
     return result;

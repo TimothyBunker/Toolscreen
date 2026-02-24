@@ -1,4 +1,4 @@
-﻿if (ImGui::BeginTabItem("Modes")) {
+﻿if (ImGui::BeginTabItem("[M] Modes")) {
     g_currentlyEditingMirror = "";
     int mode_to_remove = -1;
 

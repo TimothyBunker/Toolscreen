@@ -1,14 +1,14 @@
-if (ImGui::BeginTabItem("Misc")) {
+if (ImGui::BeginTabItem("[?] Misc")) {
     g_currentlyEditingMirror = "";
     g_imageDragMode.store(false);
     g_windowOverlayDragMode.store(false);
 
-    ImGui::SeparatorText("About");
+    ImGui::SeparatorText("Info");
 
     // Static flag for license popup
     static bool s_showLicensesPopup = false;
 
-    if (ImGui::Button("Open-Source Licenses")) { s_showLicensesPopup = true; }
+    if (ImGui::Button("Licenses")) { s_showLicensesPopup = true; }
     ImGui::SameLine();
     HelpMarker("View license information for open-source libraries used in this project.");
 

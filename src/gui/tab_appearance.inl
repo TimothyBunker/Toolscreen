@@ -1,9 +1,9 @@
-            if (ImGui::BeginTabItem("Appearance")) {
+            if (ImGui::BeginTabItem("[A] Theme")) {
                 g_currentlyEditingMirror = "";
                 g_imageDragMode.store(false);
                 g_windowOverlayDragMode.store(false);
 
-                ImGui::SeparatorText("Color Scheme");
+                ImGui::SeparatorText("Theme");
 
                 // Preset themes
                 ImGui::Text("Preset Themes:");

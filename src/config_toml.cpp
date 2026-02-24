@@ -3,6 +3,7 @@
 #include "gui.h"
 #include "utils.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -1266,6 +1267,7 @@ void KeyRebindToToml(const KeyRebind& cfg, toml::table& out) {
     out.insert("fromKey", static_cast<int64_t>(cfg.fromKey));
     out.insert("toKey", static_cast<int64_t>(cfg.toKey));
     out.insert("enabled", cfg.enabled);
+    out.insert("onlyInWorld", cfg.onlyInWorld);
     out.insert("useCustomOutput", cfg.useCustomOutput);
     out.insert("customOutputVK", static_cast<int64_t>(cfg.customOutputVK));
     out.insert("customOutputScanCode", static_cast<int64_t>(cfg.customOutputScanCode));
@@ -1275,6 +1277,7 @@ void KeyRebindFromToml(const toml::table& tbl, KeyRebind& cfg) {
     cfg.fromKey = static_cast<DWORD>(GetOr<int64_t>(tbl, "fromKey", 0));
     cfg.toKey = static_cast<DWORD>(GetOr<int64_t>(tbl, "toKey", 0));
     cfg.enabled = GetOr(tbl, "enabled", ConfigDefaults::KEY_REBIND_ENABLED);
+    cfg.onlyInWorld = GetOr(tbl, "onlyInWorld", false);
     cfg.useCustomOutput = GetOr(tbl, "useCustomOutput", ConfigDefaults::KEY_REBIND_USE_CUSTOM_OUTPUT);
     cfg.customOutputVK = static_cast<DWORD>(GetOr<int64_t>(tbl, "customOutputVK", ConfigDefaults::KEY_REBIND_CUSTOM_OUTPUT_VK));
     cfg.customOutputScanCode =
@@ -1283,6 +1286,7 @@ void KeyRebindFromToml(const toml::table& tbl, KeyRebind& cfg) {
 
 void KeyRebindsConfigToToml(const KeyRebindsConfig& cfg, toml::table& out) {
     out.insert("enabled", cfg.enabled);
+    out.insert("globalOnlyInWorld", cfg.globalOnlyInWorld);
 
     toml::array rebindsArr;
     for (const auto& rebind : cfg.rebinds) {
@@ -1295,6 +1299,7 @@ void KeyRebindsConfigToToml(const KeyRebindsConfig& cfg, toml::table& out) {
 
 void KeyRebindsConfigFromToml(const toml::table& tbl, KeyRebindsConfig& cfg) {
     cfg.enabled = GetOr(tbl, "enabled", ConfigDefaults::KEY_REBINDS_ENABLED);
+    cfg.globalOnlyInWorld = GetOr(tbl, "globalOnlyInWorld", ConfigDefaults::KEY_REBINDS_GLOBAL_ONLY_IN_WORLD);
 
     cfg.rebinds.clear();
     if (auto arr = GetArray(tbl, "rebinds")) {
@@ -1306,6 +1311,63 @@ void KeyRebindsConfigFromToml(const toml::table& tbl, KeyRebindsConfig& cfg) {
             }
         }
     }
+}
+
+void StrongholdOverlayConfigToToml(const StrongholdOverlayConfig& cfg, toml::table& out) {
+    out.insert("enabled", cfg.enabled);
+    out.insert("visible", cfg.visible);
+    out.insert("autoHideOnEyeSpy", cfg.autoHideOnEyeSpy);
+    out.insert("nonMcsrFeaturesEnabled", cfg.nonMcsrFeaturesEnabled);
+    out.insert("showDirectionArrow", cfg.showDirectionArrow);
+    out.insert("showEstimateValues", cfg.showEstimateValues);
+    out.insert("showAlignmentText", cfg.showAlignmentText);
+    out.insert("hudLayoutMode", cfg.hudLayoutMode);
+    out.insert("preferNetherCoords", cfg.preferNetherCoords);
+    out.insert("autoLockOnFirstNether", cfg.autoLockOnFirstNether);
+    out.insert("useChunkCenterTarget", cfg.useChunkCenterTarget);
+    out.insert("standaloneClipboardMode", cfg.standaloneClipboardMode);
+    out.insert("standaloneAllowNonBoatThrows", cfg.standaloneAllowNonBoatThrows);
+    out.insert("manageNinjabrainBotProcess", cfg.manageNinjabrainBotProcess);
+    out.insert("autoStartNinjabrainBot", cfg.autoStartNinjabrainBot);
+    out.insert("hideNinjabrainBotWindow", cfg.hideNinjabrainBotWindow);
+    out.insert("ninjabrainBotJarPath", cfg.ninjabrainBotJarPath);
+    out.insert("renderMonitorMode", cfg.renderMonitorMode);
+    out.insert("renderMonitorMask", static_cast<int64_t>(cfg.renderMonitorMask));
+    out.insert("x", cfg.x);
+    out.insert("y", cfg.y);
+    out.insert("scale", cfg.scale);
+    out.insert("opacity", cfg.opacity);
+    out.insert("backgroundOpacity", cfg.backgroundOpacity);
+    out.insert("pollIntervalMs", cfg.pollIntervalMs);
+}
+
+void StrongholdOverlayConfigFromToml(const toml::table& tbl, StrongholdOverlayConfig& cfg) {
+    cfg.enabled = GetOr(tbl, "enabled", cfg.enabled);
+    cfg.visible = GetOr(tbl, "visible", cfg.visible);
+    cfg.autoHideOnEyeSpy = GetOr(tbl, "autoHideOnEyeSpy", cfg.autoHideOnEyeSpy);
+    cfg.nonMcsrFeaturesEnabled = GetOr(tbl, "nonMcsrFeaturesEnabled", cfg.nonMcsrFeaturesEnabled);
+    cfg.showDirectionArrow = GetOr(tbl, "showDirectionArrow", cfg.showDirectionArrow);
+    cfg.showEstimateValues = GetOr(tbl, "showEstimateValues", cfg.showEstimateValues);
+    cfg.showAlignmentText = GetOr(tbl, "showAlignmentText", cfg.showAlignmentText);
+    cfg.hudLayoutMode = std::clamp(GetOr(tbl, "hudLayoutMode", cfg.hudLayoutMode), 0, 2);
+    if (cfg.hudLayoutMode == 1) cfg.hudLayoutMode = 2; // Compact merged into Speedrun
+    cfg.preferNetherCoords = GetOr(tbl, "preferNetherCoords", cfg.preferNetherCoords);
+    cfg.autoLockOnFirstNether = GetOr(tbl, "autoLockOnFirstNether", cfg.autoLockOnFirstNether);
+    cfg.useChunkCenterTarget = GetOr(tbl, "useChunkCenterTarget", cfg.useChunkCenterTarget);
+    cfg.standaloneClipboardMode = GetOr(tbl, "standaloneClipboardMode", cfg.standaloneClipboardMode);
+    cfg.standaloneAllowNonBoatThrows = GetOr(tbl, "standaloneAllowNonBoatThrows", cfg.standaloneAllowNonBoatThrows);
+    cfg.manageNinjabrainBotProcess = GetOr(tbl, "manageNinjabrainBotProcess", cfg.manageNinjabrainBotProcess);
+    cfg.autoStartNinjabrainBot = GetOr(tbl, "autoStartNinjabrainBot", cfg.autoStartNinjabrainBot);
+    cfg.hideNinjabrainBotWindow = GetOr(tbl, "hideNinjabrainBotWindow", cfg.hideNinjabrainBotWindow);
+    cfg.ninjabrainBotJarPath = GetStringOr(tbl, "ninjabrainBotJarPath", cfg.ninjabrainBotJarPath);
+    cfg.renderMonitorMode = std::clamp(GetOr(tbl, "renderMonitorMode", cfg.renderMonitorMode), 0, 1);
+    cfg.renderMonitorMask = static_cast<unsigned long long>(GetOr<int64_t>(tbl, "renderMonitorMask", static_cast<int64_t>(cfg.renderMonitorMask)));
+    cfg.x = GetOr(tbl, "x", cfg.x);
+    cfg.y = GetOr(tbl, "y", cfg.y);
+    cfg.scale = GetOr(tbl, "scale", cfg.scale);
+    cfg.opacity = GetOr(tbl, "opacity", cfg.opacity);
+    cfg.backgroundOpacity = GetOr(tbl, "backgroundOpacity", cfg.backgroundOpacity);
+    cfg.pollIntervalMs = GetOr(tbl, "pollIntervalMs", cfg.pollIntervalMs);
 }
 
 // ============================================================================
@@ -1375,6 +1437,11 @@ void ConfigToToml(const Config& config, toml::table& out) {
     toml::table keyRebindsTbl;
     KeyRebindsConfigToToml(config.keyRebinds, keyRebindsTbl);
     out.insert("keyRebinds", keyRebindsTbl);
+
+    // Native stronghold overlay
+    toml::table strongholdOverlayTbl;
+    StrongholdOverlayConfigToToml(config.strongholdOverlay, strongholdOverlayTbl);
+    out.insert("strongholdOverlay", strongholdOverlayTbl);
 
     // Appearance
     toml::table appearanceTbl;
@@ -1484,6 +1551,9 @@ void ConfigFromToml(const toml::table& tbl, Config& config) {
 
     // Key Rebinds
     if (auto t = GetTable(tbl, "keyRebinds")) { KeyRebindsConfigFromToml(*t, config.keyRebinds); }
+
+    // Native stronghold overlay
+    if (auto t = GetTable(tbl, "strongholdOverlay")) { StrongholdOverlayConfigFromToml(*t, config.strongholdOverlay); }
 
     // Appearance
     if (auto t = GetTable(tbl, "appearance")) { AppearanceConfigFromToml(*t, config.appearance); }
@@ -1609,6 +1679,7 @@ bool SaveConfigToTomlFile(const Config& config, const std::wstring& path) {
                                                  "eyezoom",
                                                  "cursors",
                                                  "keyRebinds",
+                                                 "strongholdOverlay",
                                                  "appearance",
                                                  "mode",
                                                  "mirror",
