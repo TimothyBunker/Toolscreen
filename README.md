@@ -2,7 +2,7 @@
 
 Custom Toolscreen fork for Minecraft 1.16.1 stronghold routing workflows.
 
-## Download Here
+## Download [Here]([URL](https://github.com/TimothyBunker/Toolscreen/releases))
 
 - Release page: https://github.com/TimothyBunker/Toolscreen/releases
 - Main artifact: `Toolscreen-GuckerOffficial-Edition-<version>.jar`
