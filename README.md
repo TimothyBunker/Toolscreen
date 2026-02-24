@@ -13,6 +13,16 @@ Custom Toolscreen fork for Minecraft 1.16.1 stronghold routing workflows.
 2. Double-click the jar once to patch/update the instance copy.
 3. Launch Minecraft from that instance.
 
+## Setup Reference Images
+
+Instance folder example:
+
+<img width="794" height="623" alt="instance_folder_ref" src="https://github.com/user-attachments/assets/5643b8e2-063e-46a6-99f6-ec2fe99a9835" />
+
+Double-click installer example:
+
+<img width="820" height="326" alt="double_click" src="https://github.com/user-attachments/assets/682baf4c-60b1-4501-941c-de53cd0a11cd" />
+
 ## Core Hotkeys
 
 - `H`: show/hide stronghold HUD
