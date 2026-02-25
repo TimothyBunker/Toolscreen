@@ -442,7 +442,9 @@ struct StrongholdOverlayConfig {
     bool autoLockOnFirstNether = true;   // Auto-lock once after entering nether/boat throw
     bool useChunkCenterTarget = false;   // False = chunk corner (matches NBB display)
     bool standaloneClipboardMode = true; // Read F3+C clipboard directly in Toolscreen (no NBB process/API required)
-    bool standaloneAllowNonBoatThrows = true; // Default OFF boat-eye: use normal eye throws (1-2 eye method)
+    bool standaloneAllowNonBoatThrows = true; // Double Eye mode: use normal eye throws (1-2 eye method)
+    bool renderInGameOverlay = true;          // Render stronghold HUD on the Minecraft game view
+    bool renderCompanionOverlay = true;       // Render detached companion window overlays on non-game monitors
     bool manageNinjabrainBotProcess = false; // Standalone-only release default
     bool autoStartNinjabrainBot = false;     // Standalone-only release default
     bool hideNinjabrainBotWindow = false;    // Standalone-only release default
@@ -455,6 +457,19 @@ struct StrongholdOverlayConfig {
     float opacity = 1.0f;                // Text/border opacity multiplier
     float backgroundOpacity = 0.55f;     // Panel background alpha multiplier
     int pollIntervalMs = 125;            // API polling interval
+};
+struct NotesOverlayConfig {
+    bool enabled = true;             // Master toggle for notes overlay feature
+    bool visible = false;            // Startup visibility (hidden by default)
+    float backgroundOpacity = 0.62f; // Full-screen dim backdrop alpha
+    float panelScale = 1.0f;         // Notes panel scale multiplier
+    bool hotkeyCtrl = true;          // Notes toggle hotkey requires Ctrl
+    bool hotkeyShift = true;         // Notes toggle hotkey requires Shift
+    bool hotkeyAlt = false;          // Notes toggle hotkey requires Alt
+    int hotkeyKey = 'N';             // Notes toggle key virtual-key code
+    std::string markdownDirectory = "notes/General"; // Base directory for .md notes (IGN uses markdownDirectory/IGN)
+    std::string pdfDirectory = "notes/PDF";          // Base directory for exported PDFs
+    bool openPdfFolderAfterExport = false;           // Optionally open the containing folder after PDF export
 };
 struct Config {
     int configVersion = 1; // Config version for automatic upgrades
@@ -481,6 +496,7 @@ struct Config {
     bool hideAnimationsInGame = false;                      // Show transition animations only on OBS, not in-game
     KeyRebindsConfig keyRebinds;                            // Key rebinding configuration
     StrongholdOverlayConfig strongholdOverlay;              // Native stronghold direction overlay
+    NotesOverlayConfig notesOverlay;                        // Notes overlay (IGN + General notes)
     AppearanceConfig appearance;                            // GUI color scheme configuration
     int keyRepeatStartDelay = 0;                            // Key repeat start delay (0 = disabled, 1-500ms = custom)
     int keyRepeatDelay = 0;                                 // Key repeat delay between repeats (0 = disabled, 1-500ms = custom)

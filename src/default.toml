@@ -92,6 +92,8 @@ autoLockOnFirstNether = true
 useChunkCenterTarget = false
 standaloneClipboardMode = true
 standaloneAllowNonBoatThrows = true
+renderInGameOverlay = true
+renderCompanionOverlay = true
 manageNinjabrainBotProcess = false
 autoStartNinjabrainBot = false
 hideNinjabrainBotWindow = false
@@ -104,6 +106,19 @@ scale = 1.0
 opacity = 1.0
 backgroundOpacity = 0.55
 pollIntervalMs = 125
+
+[notesOverlay]
+enabled = true
+visible = false
+backgroundOpacity = 0.62
+panelScale = 1.0
+hotkeyCtrl = true
+hotkeyShift = true
+hotkeyAlt = false
+hotkeyKey = 78
+markdownDirectory = "notes/General"
+pdfDirectory = "notes/PDF"
+openPdfFolderAfterExport = false
 
 [[hotkey]]
 altSecondaryModes = []

@@ -38,6 +38,7 @@ struct EyeZoomConfig;
 struct KeyRebind;
 struct KeyRebindsConfig;
 struct StrongholdOverlayConfig;
+struct NotesOverlayConfig;
 struct AppearanceConfig;
 struct Config;
 
@@ -71,6 +72,7 @@ void EyeZoomConfigToToml(const EyeZoomConfig& cfg, toml::table& out);
 void KeyRebindToToml(const KeyRebind& cfg, toml::table& out);
 void KeyRebindsConfigToToml(const KeyRebindsConfig& cfg, toml::table& out);
 void StrongholdOverlayConfigToToml(const StrongholdOverlayConfig& cfg, toml::table& out);
+void NotesOverlayConfigToToml(const NotesOverlayConfig& cfg, toml::table& out);
 void AppearanceConfigToToml(const AppearanceConfig& cfg, toml::table& out);
 void ConfigToToml(const Config& config, toml::table& out);
 
@@ -103,6 +105,7 @@ void EyeZoomConfigFromToml(const toml::table& tbl, EyeZoomConfig& cfg);
 void KeyRebindFromToml(const toml::table& tbl, KeyRebind& cfg);
 void KeyRebindsConfigFromToml(const toml::table& tbl, KeyRebindsConfig& cfg);
 void StrongholdOverlayConfigFromToml(const toml::table& tbl, StrongholdOverlayConfig& cfg);
+void NotesOverlayConfigFromToml(const toml::table& tbl, NotesOverlayConfig& cfg);
 void AppearanceConfigFromToml(const toml::table& tbl, AppearanceConfig& cfg);
 void ConfigFromToml(const toml::table& tbl, Config& config);
 

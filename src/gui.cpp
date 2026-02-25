@@ -2625,6 +2625,14 @@ void RenderSettingsGUI() {
             ImGui::SameLine();
             ImGui::TextDisabled("|");
             ImGui::SameLine();
+            ImGui::TextDisabled("NBB:");
+            ImGui::SameLine();
+            DrawInlineLink("nbb_credit_link", "Ninjabrain1", ImVec4(0.64f, 0.88f, 0.78f, 1.0f), "Open Ninjabrain-Bot creator profile",
+                           "https://github.com/Ninjabrain1", "Ninjabrain-Bot creator");
+
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
             ImGui::TextDisabled("Twitch:");
             ImGui::SameLine();
             DrawInlineLink("twitch_link", "twitch.tv/guckerofficial", ImVec4(0.72f, 0.56f, 1.0f, 1.0f), "Open Twitch channel",
@@ -2660,6 +2668,18 @@ void RenderSettingsGUI() {
                 // BASIC GENERAL TAB - Simplified mode selection with inline hotkeys
                 // =====================================================================
 #include "gui/tab_basic_general.inl"
+                // =====================================================================
+                // BASIC STRONGHOLD TAB - Stronghold overlay settings
+                // =====================================================================
+#include "gui/tab_basic_stronghold.inl"
+                // =====================================================================
+                // BASIC NOTES TAB - Notes overlay settings
+                // =====================================================================
+#include "gui/tab_basic_notes.inl"
+                // =====================================================================
+                // BASIC MACROS TAB - Macro controls and F3 rebind
+                // =====================================================================
+#include "gui/tab_basic_macros.inl"
                 // =====================================================================
                 // BASIC OTHER TAB - Miscellaneous settings
                 // =====================================================================

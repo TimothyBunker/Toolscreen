@@ -35,6 +35,14 @@ Double-click installer example:
 - `Num5`: calc reset
 - `Ctrl+Shift+M`: toggle all macros on/off
 
+## Notes Overlay
+
+- Markdown editor with live preview tabs (`IGN` and `General`)
+- Clickable links in preview (`Video`/`Open` actions)
+- Autosave while editing + IGN autosave guard when out-of-game
+- PDF export with overwrite/new-file conflict options
+- Quickstart bootstrap note seeds once for new installs (user edits/deletes are preserved after first seed)
+
 ## Build (Windows x64)
 
 ```powershell
@@ -77,4 +85,5 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package_release.ps1
 ## Attribution
 
 - Toolscreen: https://github.com/jojoe77777/Toolscreen
-- NinjaBrain Bot: https://github.com/Ninjabrain1/Ninjabrain-Bot
+- Ninjabrain-Bot: https://github.com/Ninjabrain1/Ninjabrain-Bot
+- Ninjabrain-Bot creator: https://github.com/Ninjabrain1

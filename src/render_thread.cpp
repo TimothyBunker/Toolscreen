@@ -2,6 +2,7 @@
 #include "fake_cursor.h"
 #include "gui.h"
 #include "mirror_thread.h"
+#include "notes_overlay.h"
 #include "obs_thread.h"
 #include "profiler.h"
 #include "render.h"
@@ -441,6 +442,17 @@ static void DrawEnderEyeIconImGui(ImDrawList* drawList, const ImVec2& center, fl
     }
 }
 
+static void DrawDoubleEnderEyeIconImGui(ImDrawList* drawList, const ImVec2& center, float size, float certaintyPercent, ImU32 strokeColor) {
+    if (!drawList || size <= 2.0f) return;
+    const float certainty = std::clamp(certaintyPercent, 0.0f, 100.0f);
+    const float offset = std::max(1.0f, size * 0.18f);
+    const ImU32 backStroke = RT_LerpColor(strokeColor, IM_COL32(200, 214, 235, static_cast<int>((strokeColor >> IM_COL32_A_SHIFT) & 0xFF)),
+                                          0.22f);
+    DrawEnderEyeIconImGui(drawList, ImVec2(center.x - offset * 0.55f, center.y + offset * 0.16f), size * 0.88f, certainty * 0.94f,
+                          backStroke);
+    DrawEnderEyeIconImGui(drawList, ImVec2(center.x + offset * 0.48f, center.y - offset * 0.14f), size, certainty, strokeColor);
+}
+
 static void DrawStrongholdStatusIconImGui(ImDrawList* drawList, const ImVec2& center, float size, bool boatModeEnabled, int boatState,
                                           bool hasCertainty, float certaintyPercent, ImU32 boatBlueColor, ImU32 boatGreenColor,
                                           ImU32 boatRedColor, ImU32 strokeColor) {
@@ -457,7 +469,7 @@ static void DrawStrongholdStatusIconImGui(ImDrawList* drawList, const ImVec2& ce
     }
 
     const float certainty = hasCertainty ? std::clamp(certaintyPercent, 0.0f, 100.0f) : 0.0f;
-    DrawEnderEyeIconImGui(drawList, center, size, certainty, strokeColor);
+    DrawDoubleEnderEyeIconImGui(drawList, center, size, certainty, strokeColor);
 }
 
 static void DrawLockBadgeImGui(ImDrawList* drawList, const ImVec2& topLeft, float size, bool locked, ImU32 fillColor, ImU32 strokeColor) {
@@ -4337,11 +4349,14 @@ static void RenderThreadFunc(void* gameGLContext) {
 
             StrongholdOverlayRenderSnapshot strongholdOverlaySnap = GetStrongholdOverlayRenderSnapshot();
             bool shouldRenderStrongholdOverlay = strongholdOverlaySnap.enabled && strongholdOverlaySnap.visible &&
+                                                strongholdOverlaySnap.renderInGameOverlay &&
                                                 RT_ShouldRenderStrongholdOverlayOnCurrentMonitor(strongholdOverlaySnap);
+            bool shouldRenderNotesOverlay = HasNotesOverlayPendingWork();
 
             // Check if we need to render any ImGui content
             bool shouldRenderAnyImGui = request.shouldRenderGui || request.showPerformanceOverlay || request.showProfiler ||
-                                        request.showEyeZoom || request.showTextureGrid || shouldRenderStrongholdOverlay;
+                                        request.showEyeZoom || request.showTextureGrid || shouldRenderStrongholdOverlay ||
+                                        shouldRenderNotesOverlay;
 
             // Lazy-init ImGui the first time we actually need to render it.
             // Some systems can start the render thread before a valid HWND is published,
@@ -4675,6 +4690,8 @@ static void RenderThreadFunc(void* gameGLContext) {
                 if (shouldRenderStrongholdOverlay) {
                     RT_RenderStrongholdOverlayImGui(strongholdOverlaySnap, request.shouldRenderGui);
                 }
+
+                if (shouldRenderNotesOverlay) { RenderNotesOverlayImGui(); }
 
                 // Render texture grid labels
                 RenderCachedTextureGridLabels();

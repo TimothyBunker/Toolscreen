@@ -3,6 +3,7 @@
 #include "fake_cursor.h"
 #include "gui.h"
 #include "logic_thread.h"
+#include "notes_overlay.h"
 #include "profiler.h"
 #include "render.h"
 #include "utils.h"
@@ -356,6 +357,8 @@ InputHandlerResult HandleStrongholdOverlayHotkey(HWND hWnd, UINT uMsg, WPARAM wP
     PROFILE_SCOPE("HandleStrongholdOverlayHotkey");
     (void)hWnd;
 
+    if (IsNotesOverlayInputCaptureActive()) { return { false, 0 }; }
+
     if (uMsg != WM_KEYDOWN && uMsg != WM_SYSKEYDOWN) { return { false, 0 }; }
 
     // Support numpad controls even when NumLock is OFF (VK_UP/DOWN/LEFT/RIGHT/CLEAR)
@@ -400,6 +403,33 @@ InputHandlerResult HandleStrongholdOverlayHotkey(HWND hWnd, UINT uMsg, WPARAM wP
     bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     if (!HandleStrongholdOverlayHotkeyH(shiftDown, ctrlDown)) { return { false, 0 }; }
+    return { true, 1 };
+}
+
+InputHandlerResult HandleNotesOverlayHotkey(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    PROFILE_SCOPE("HandleNotesOverlayHotkey");
+    (void)hWnd;
+
+    if (uMsg != WM_KEYDOWN && uMsg != WM_SYSKEYDOWN) { return { false, 0 }; }
+
+    const bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+    auto cfgSnap = GetConfigSnapshot();
+    if (!cfgSnap || !cfgSnap->notesOverlay.enabled) { return { false, 0 }; }
+    const int configuredVk = std::clamp(cfgSnap->notesOverlay.hotkeyKey, 1, 255);
+
+    // Ignore repeat toggles while combo is held.
+    if ((lParam & (1LL << 30)) != 0) {
+        if (static_cast<int>(wParam) == configuredVk && ctrlDown == cfgSnap->notesOverlay.hotkeyCtrl &&
+            shiftDown == cfgSnap->notesOverlay.hotkeyShift && altDown == cfgSnap->notesOverlay.hotkeyAlt) {
+            return { true, 1 };
+        }
+        return { false, 0 };
+    }
+
+    if (!HandleNotesOverlayToggleHotkey(static_cast<unsigned int>(wParam), ctrlDown, shiftDown, altDown)) { return { false, 0 }; }
     return { true, 1 };
 }
 
@@ -461,6 +491,51 @@ InputHandlerResult HandleWindowOverlayKeyboard(HWND hWnd, UINT uMsg, WPARAM wPar
     if (!imguiWantsKeyboard) {
         if (ForwardKeyboardToWindowOverlay(uMsg, wParam, lParam)) { return { true, 1 }; }
     }
+    return { false, 0 };
+}
+
+InputHandlerResult HandleNotesOverlayInputCapture(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    PROFILE_SCOPE("HandleNotesOverlayInputCapture");
+    (void)hWnd;
+    (void)wParam;
+    (void)lParam;
+
+    if (!IsNotesOverlayInputCaptureActive()) { return { false, 0 }; }
+
+    if (ImGui::GetCurrentContext()) { ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam); }
+
+    switch (uMsg) {
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(NULL, IDC_ARROW));
+        return { true, TRUE };
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_MBUTTONDBLCLK:
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+    case WM_CHAR:
+    case WM_SYSCHAR:
+    case WM_UNICHAR:
+    case WM_INPUT:
+        return { true, 1 };
+    default:
+        break;
+    }
+
     return { false, 0 };
 }
 
@@ -1300,8 +1375,14 @@ LRESULT CALLBACK SubclassedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     result = HandleWindowValidation(hWnd, uMsg, wParam, lParam);
     if (result.consumed) return result.result;
 
+    result = HandleNotesOverlayHotkey(hWnd, uMsg, wParam, lParam);
+    if (result.consumed) return result.result;
+
     // Keep stronghold panel controls responsive even if Minecraft temporarily exits fullscreen.
     result = HandleStrongholdOverlayHotkey(hWnd, uMsg, wParam, lParam);
+    if (result.consumed) return result.result;
+
+    result = HandleNotesOverlayInputCapture(hWnd, uMsg, wParam, lParam);
     if (result.consumed) return result.result;
 
     result = HandleNonFullscreenCheck(hWnd, uMsg, wParam, lParam);

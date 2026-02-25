@@ -1327,6 +1327,8 @@ void StrongholdOverlayConfigToToml(const StrongholdOverlayConfig& cfg, toml::tab
     out.insert("useChunkCenterTarget", cfg.useChunkCenterTarget);
     out.insert("standaloneClipboardMode", cfg.standaloneClipboardMode);
     out.insert("standaloneAllowNonBoatThrows", cfg.standaloneAllowNonBoatThrows);
+    out.insert("renderInGameOverlay", cfg.renderInGameOverlay);
+    out.insert("renderCompanionOverlay", cfg.renderCompanionOverlay);
     out.insert("manageNinjabrainBotProcess", cfg.manageNinjabrainBotProcess);
     out.insert("autoStartNinjabrainBot", cfg.autoStartNinjabrainBot);
     out.insert("hideNinjabrainBotWindow", cfg.hideNinjabrainBotWindow);
@@ -1356,6 +1358,8 @@ void StrongholdOverlayConfigFromToml(const toml::table& tbl, StrongholdOverlayCo
     cfg.useChunkCenterTarget = GetOr(tbl, "useChunkCenterTarget", cfg.useChunkCenterTarget);
     cfg.standaloneClipboardMode = GetOr(tbl, "standaloneClipboardMode", cfg.standaloneClipboardMode);
     cfg.standaloneAllowNonBoatThrows = GetOr(tbl, "standaloneAllowNonBoatThrows", cfg.standaloneAllowNonBoatThrows);
+    cfg.renderInGameOverlay = GetOr(tbl, "renderInGameOverlay", cfg.renderInGameOverlay);
+    cfg.renderCompanionOverlay = GetOr(tbl, "renderCompanionOverlay", cfg.renderCompanionOverlay);
     cfg.manageNinjabrainBotProcess = GetOr(tbl, "manageNinjabrainBotProcess", cfg.manageNinjabrainBotProcess);
     cfg.autoStartNinjabrainBot = GetOr(tbl, "autoStartNinjabrainBot", cfg.autoStartNinjabrainBot);
     cfg.hideNinjabrainBotWindow = GetOr(tbl, "hideNinjabrainBotWindow", cfg.hideNinjabrainBotWindow);
@@ -1368,6 +1372,34 @@ void StrongholdOverlayConfigFromToml(const toml::table& tbl, StrongholdOverlayCo
     cfg.opacity = GetOr(tbl, "opacity", cfg.opacity);
     cfg.backgroundOpacity = GetOr(tbl, "backgroundOpacity", cfg.backgroundOpacity);
     cfg.pollIntervalMs = GetOr(tbl, "pollIntervalMs", cfg.pollIntervalMs);
+}
+
+void NotesOverlayConfigToToml(const NotesOverlayConfig& cfg, toml::table& out) {
+    out.insert("enabled", cfg.enabled);
+    out.insert("visible", cfg.visible);
+    out.insert("backgroundOpacity", cfg.backgroundOpacity);
+    out.insert("panelScale", cfg.panelScale);
+    out.insert("hotkeyCtrl", cfg.hotkeyCtrl);
+    out.insert("hotkeyShift", cfg.hotkeyShift);
+    out.insert("hotkeyAlt", cfg.hotkeyAlt);
+    out.insert("hotkeyKey", static_cast<int64_t>(cfg.hotkeyKey));
+    out.insert("markdownDirectory", cfg.markdownDirectory);
+    out.insert("pdfDirectory", cfg.pdfDirectory);
+    out.insert("openPdfFolderAfterExport", cfg.openPdfFolderAfterExport);
+}
+
+void NotesOverlayConfigFromToml(const toml::table& tbl, NotesOverlayConfig& cfg) {
+    cfg.enabled = GetOr(tbl, "enabled", cfg.enabled);
+    cfg.visible = GetOr(tbl, "visible", cfg.visible);
+    cfg.backgroundOpacity = std::clamp(GetOr(tbl, "backgroundOpacity", cfg.backgroundOpacity), 0.0f, 1.0f);
+    cfg.panelScale = std::clamp(GetOr(tbl, "panelScale", cfg.panelScale), 0.5f, 2.0f);
+    cfg.hotkeyCtrl = GetOr(tbl, "hotkeyCtrl", cfg.hotkeyCtrl);
+    cfg.hotkeyShift = GetOr(tbl, "hotkeyShift", cfg.hotkeyShift);
+    cfg.hotkeyAlt = GetOr(tbl, "hotkeyAlt", cfg.hotkeyAlt);
+    cfg.hotkeyKey = std::clamp(GetOr(tbl, "hotkeyKey", cfg.hotkeyKey), 1, 255);
+    cfg.markdownDirectory = GetStringOr(tbl, "markdownDirectory", cfg.markdownDirectory);
+    cfg.pdfDirectory = GetStringOr(tbl, "pdfDirectory", cfg.pdfDirectory);
+    cfg.openPdfFolderAfterExport = GetOr(tbl, "openPdfFolderAfterExport", cfg.openPdfFolderAfterExport);
 }
 
 // ============================================================================
@@ -1442,6 +1474,11 @@ void ConfigToToml(const Config& config, toml::table& out) {
     toml::table strongholdOverlayTbl;
     StrongholdOverlayConfigToToml(config.strongholdOverlay, strongholdOverlayTbl);
     out.insert("strongholdOverlay", strongholdOverlayTbl);
+
+    // Notes overlay
+    toml::table notesOverlayTbl;
+    NotesOverlayConfigToToml(config.notesOverlay, notesOverlayTbl);
+    out.insert("notesOverlay", notesOverlayTbl);
 
     // Appearance
     toml::table appearanceTbl;
@@ -1554,6 +1591,9 @@ void ConfigFromToml(const toml::table& tbl, Config& config) {
 
     // Native stronghold overlay
     if (auto t = GetTable(tbl, "strongholdOverlay")) { StrongholdOverlayConfigFromToml(*t, config.strongholdOverlay); }
+
+    // Notes overlay
+    if (auto t = GetTable(tbl, "notesOverlay")) { NotesOverlayConfigFromToml(*t, config.notesOverlay); }
 
     // Appearance
     if (auto t = GetTable(tbl, "appearance")) { AppearanceConfigFromToml(*t, config.appearance); }
@@ -1680,6 +1720,7 @@ bool SaveConfigToTomlFile(const Config& config, const std::wstring& path) {
                                                  "cursors",
                                                  "keyRebinds",
                                                  "strongholdOverlay",
+                                                 "notesOverlay",
                                                  "appearance",
                                                  "mode",
                                                  "mirror",

@@ -3707,7 +3707,7 @@ void UpdateStrongholdOverlayState() {
         st.warningLabel.clear();
         st.showComputedDetails = false;
         st.boatState = kBoatStateUninitialized;
-        st.boatLabel = (useStandaloneSource && overlayCfg.standaloneAllowNonBoatThrows) ? "Boat: OFF" : "Boat: UNINIT";
+        st.boatLabel = (useStandaloneSource && overlayCfg.standaloneAllowNonBoatThrows) ? "Mode: D-EYE" : "Boat: UNINIT";
         st.statusLabel = GetUnlockedStatusLabel(st.blockAutoLockUntilThrowClear);
         st.infoLabel = useStandaloneSource ? "No F3+C snapshot yet. Copy F3+C in-game." : "No player snapshot yet.";
         st.debugBasePredictionsLabel.clear();
@@ -3929,7 +3929,7 @@ void UpdateStrongholdOverlayState() {
     int boatState = useStandaloneSource ? s_standaloneStrongholdState.boatState : kBoatStateUninitialized;
     if (useStandaloneSource && overlayCfg.standaloneAllowNonBoatThrows) {
         st.boatState = kBoatStateUninitialized;
-        st.boatLabel = "Boat: OFF";
+        st.boatLabel = "Mode: D-EYE";
     } else {
         if (activeHasBoatThrow) {
             boatState = kBoatStateGood;
@@ -4057,6 +4057,8 @@ StrongholdOverlayRenderSnapshot GetStrongholdOverlayRenderSnapshot() {
     snapshot.showDirectionArrow = nonMcsrEnabled && overlayCfg.showDirectionArrow;
     snapshot.showEstimateValues = nonMcsrEnabled && overlayCfg.showEstimateValues;
     snapshot.showAlignmentText = nonMcsrEnabled && overlayCfg.showAlignmentText;
+    snapshot.renderInGameOverlay = overlayCfg.renderInGameOverlay;
+    snapshot.renderCompanionOverlay = overlayCfg.renderCompanionOverlay;
     snapshot.boatModeEnabled = !overlayCfg.standaloneAllowNonBoatThrows;
     snapshot.hudLayoutMode = std::clamp(overlayCfg.hudLayoutMode, 0, 2);
     if (snapshot.hudLayoutMode == 1) snapshot.hudLayoutMode = 2; // Compact merged into Speedrun

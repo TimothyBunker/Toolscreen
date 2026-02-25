@@ -267,6 +267,16 @@ void DrawEnderEyeIcon(Gdiplus::Graphics& g, float centerX, float centerY, float 
     }
 }
 
+void DrawDoubleEnderEyeIcon(Gdiplus::Graphics& g, float centerX, float centerY, float size, float certaintyPercent,
+                            const Gdiplus::Color& strokeColor) {
+    if (size <= 2.0f) return;
+    const float certainty = std::clamp(certaintyPercent, 0.0f, 100.0f);
+    const float offset = std::max(1.0f, size * 0.18f);
+    const Gdiplus::Color backStroke = LerpColor(strokeColor, Gdiplus::Color(strokeColor.GetA(), 200, 214, 235), 0.22f);
+    DrawEnderEyeIcon(g, centerX - offset * 0.55f, centerY + offset * 0.16f, size * 0.88f, certainty * 0.94f, backStroke);
+    DrawEnderEyeIcon(g, centerX + offset * 0.48f, centerY - offset * 0.14f, size, certainty, strokeColor);
+}
+
 void DrawStrongholdStatusIcon(Gdiplus::Graphics& g, float centerX, float centerY, float size, bool boatModeEnabled, int boatState,
                               bool hasCertainty, float certaintyPercent, const Gdiplus::Color& boatBlue, const Gdiplus::Color& boatGreen,
                               const Gdiplus::Color& boatRed, const Gdiplus::Color& strokeColor) {
@@ -281,7 +291,7 @@ void DrawStrongholdStatusIcon(Gdiplus::Graphics& g, float centerX, float centerY
         return;
     }
     const float certainty = hasCertainty ? std::clamp(certaintyPercent, 0.0f, 100.0f) : 0.0f;
-    DrawEnderEyeIcon(g, centerX, centerY, size, certainty, strokeColor);
+    DrawDoubleEnderEyeIcon(g, centerX, centerY, size, certainty, strokeColor);
 }
 
 LRESULT CALLBACK CompanionWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1031,6 +1041,7 @@ void UpdateStrongholdCompanionOverlays() {
         static bool s_hasLastStateLogTime = false;
         std::ostringstream ss;
         ss << "Stronghold companion state: enabled=" << snap.enabled << " visible=" << snap.visible
+           << " companion=" << snap.renderCompanionOverlay
            << " mode=" << snap.renderMonitorMode << " mask=0x" << std::hex << snap.renderMonitorMask << std::dec
            << " monitors=" << monitors.size() << " game=display" << gameDisplayNumber << " bit=" << gameMonitorMaskBit;
         const std::string line = ss.str();
@@ -1043,7 +1054,7 @@ void UpdateStrongholdCompanionOverlays() {
         }
     }
 
-    if (!snap.enabled || !snap.visible) {
+    if (!snap.enabled || !snap.visible || !snap.renderCompanionOverlay) {
         DestroyAllCompanionWindows();
         return;
     }
@@ -1061,7 +1072,8 @@ void UpdateStrongholdCompanionOverlays() {
         static auto s_lastTopologyLogTime = std::chrono::steady_clock::time_point{};
         static bool s_hasLastTopologyLogTime = false;
         std::ostringstream topo;
-        topo << "enabled=" << snap.enabled << " visible=" << snap.visible << " mode=" << snap.renderMonitorMode << " mask=0x" << std::hex
+        topo << "enabled=" << snap.enabled << " visible=" << snap.visible << " companion=" << snap.renderCompanionOverlay
+             << " mode=" << snap.renderMonitorMode << " mask=0x" << std::hex
              << snap.renderMonitorMask << std::dec << " monitors=" << monitors.size() << " game=display" << gameDisplayNumber
              << " bit=" << gameMonitorMaskBit << " targets=";
         bool first = true;

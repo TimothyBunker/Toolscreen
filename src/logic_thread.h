@@ -37,6 +37,8 @@ struct StrongholdOverlayRenderSnapshot {
     bool showDirectionArrow = true;
     bool showEstimateValues = true;
     bool showAlignmentText = true;
+    bool renderInGameOverlay = true;
+    bool renderCompanionOverlay = true;
     bool boatModeEnabled = true;
     bool preferNetherCoords = true;
     bool usingNetherCoords = true;

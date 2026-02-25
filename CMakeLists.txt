@@ -33,6 +33,7 @@ add_library(Toolscreen SHARED
     src/input_hook.cpp
     src/logic_thread.cpp
     src/mirror_thread.cpp
+    src/notes_overlay.cpp
     src/obs_thread.cpp
     src/pch.cpp
     src/profiler.cpp
