@@ -2,9 +2,9 @@
 
 Custom Toolscreen fork for Minecraft 1.16.1 stronghold routing workflows.
 
-## Download Here
+## [Download Here](https://github.com/TimothyBunker/Toolscreen/releases)
 
-- [Download Latest Releases](https://github.com/TimothyBunker/Toolscreen/releases)
+- Release page: https://github.com/TimothyBunker/Toolscreen/releases
 - Main artifact: `Toolscreen-GuckerOffficial-Edition-<version>.jar`
 
 ## Install (MultiMC/Prism Launcher)
@@ -13,18 +13,19 @@ Custom Toolscreen fork for Minecraft 1.16.1 stronghold routing workflows.
 2. Double-click the jar once to patch/update the instance copy.
 3. Launch Minecraft from that instance.
 
-## Setup Reference Images
+## Setup Reference
 
 Instance folder example:
 
-<img width="794" height="623" alt="instance_folder_ref" src="https://github.com/user-attachments/assets/5643b8e2-063e-46a6-99f6-ec2fe99a9835" />
+<img width="794" height="623" alt="instance_folder_ref" src="https://github.com/user-attachments/assets/6d5d66eb-ab61-4cb0-a3a0-efbabcd39ae8" />
 
 Double-click installer example:
 
-<img width="820" height="326" alt="double_click" src="https://github.com/user-attachments/assets/682baf4c-60b1-4501-941c-de53cd0a11cd" />
+<img width="820" height="326" alt="double_click" src="https://github.com/user-attachments/assets/f1507485-4cfa-41f4-aac8-a2a29b91997d" />
 
 ## Core Hotkeys
 
+- `Ctrl+I`: Open Toolscreen GUI
 - `H`: show/hide stronghold HUD
 - `Shift+H`: lock/unlock target
 - `Ctrl+Shift+H`: reset target/throws state
