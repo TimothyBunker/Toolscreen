@@ -36,6 +36,7 @@ add_library(Toolscreen SHARED
     src/notes_overlay.cpp
     src/obs_thread.cpp
     src/pch.cpp
+    src/practice_world_launch.cpp
     src/profiler.cpp
     src/render.cpp
     src/render_thread.cpp
@@ -60,6 +61,26 @@ add_library(Toolscreen SHARED
     third_party/minhook/src/hde/hde64.c
 )
 
+# Optional JNI support for direct in-process world launch.
+set(TOOLSCREEN_JNI_AVAILABLE OFF)
+find_package(JNI QUIET)
+if (JNI_FOUND)
+    target_include_directories(Toolscreen PRIVATE ${JNI_INCLUDE_DIRS})
+    set(TOOLSCREEN_JNI_AVAILABLE ON)
+else()
+    set(_toolscreen_java_hints
+        "$ENV{JAVA_HOME}"
+        "${CMAKE_SOURCE_DIR}/../graalvm-jdk-21.0.9+7.1"
+        "${CMAKE_SOURCE_DIR}/../jdk"
+    )
+    find_path(TOOLSCREEN_JNI_INCLUDE_DIR jni.h HINTS ${_toolscreen_java_hints} PATH_SUFFIXES include)
+    find_path(TOOLSCREEN_JNI_MD_INCLUDE_DIR jni_md.h HINTS ${_toolscreen_java_hints} PATH_SUFFIXES include/win32)
+    if (TOOLSCREEN_JNI_INCLUDE_DIR AND TOOLSCREEN_JNI_MD_INCLUDE_DIR)
+        target_include_directories(Toolscreen PRIVATE ${TOOLSCREEN_JNI_INCLUDE_DIR} ${TOOLSCREEN_JNI_MD_INCLUDE_DIR})
+        set(TOOLSCREEN_JNI_AVAILABLE ON)
+    endif()
+endif()
+
 target_include_directories(Toolscreen PRIVATE
     src
     third_party/minhook/include
@@ -81,6 +102,11 @@ target_compile_definitions(Toolscreen PRIVATE
     TOOLSCREEN_DISABLE_ABORT_OVERRIDE
     GLEW_STATIC
 )
+if (TOOLSCREEN_JNI_AVAILABLE)
+    target_compile_definitions(Toolscreen PRIVATE TOOLSCREEN_HAS_JNI=1)
+else()
+    target_compile_definitions(Toolscreen PRIVATE TOOLSCREEN_HAS_JNI=0)
+endif()
 
 if (TOOLSCREEN_FORCE_MCSR_SAFE)
     target_compile_definitions(Toolscreen PRIVATE TOOLSCREEN_FORCE_MCSR_SAFE=1)

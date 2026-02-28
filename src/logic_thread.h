@@ -92,6 +92,63 @@ struct StrongholdOverlayRenderSnapshot {
     bool showComputedDetails = false;
 };
 
+struct McsrApiTrackerRenderSnapshot {
+    bool enabled = false;
+    bool visible = false;
+    bool renderInGameOverlay = true;
+    bool apiOnline = false;
+    bool refreshOnlyMode = true;
+    float scale = 1.0f;
+    float overlayOpacity = 1.0f;
+    float backgroundOpacity = 0.55f;
+    int x = 0;
+    int y = 0;
+    std::string headerLabel;
+    std::string statusLabel;
+    std::string displayPlayer;
+    std::string requestedPlayer;
+    std::string autoDetectedPlayer;
+    std::string avatarImagePath;
+    std::string flagImagePath;
+    std::string country;
+    int eloRank = 0;
+    int eloRate = 0;
+    int peakElo = 0;
+    int seasonWins = 0;
+    int seasonLosses = 0;
+    int seasonCompletions = 0;
+    int seasonBestWinStreak = 0;
+    int seasonPoints = 0;
+    int bestTimeMs = 0;
+    int averageResultTimeMs = 0;
+    int profileAverageTimeMs = 0;
+    int recentWins = 0;
+    int recentLosses = 0;
+    int recentDraws = 0;
+    float recentForfeitRatePercent = 0.0f;
+    float profileForfeitRatePercent = 0.0f;
+    struct MatchRow {
+        std::string opponent;
+        std::string resultLabel;
+        std::string detailLabel;
+        std::string ageLabel;
+        int resultType = 0; // 1=win, 0=draw, -1=loss
+        bool forfeited = false;
+        int categoryType = 0; // 0=ranked, 1=private, 2=casual, 3=event, 4=other
+    };
+    struct TrendPoint {
+        int elo = 0;
+        std::string opponent;
+        std::string resultLabel;
+        std::string detailLabel;
+        std::string ageLabel;
+    };
+    std::vector<int> eloHistory;
+    std::vector<TrendPoint> eloTrendPoints;
+    std::vector<MatchRow> recentMatches;
+    std::vector<std::string> suggestedPlayers;
+};
+
 // Update the cached viewport mode data (called by logic_thread when mode changes)
 void UpdateCachedViewportMode();
 
@@ -147,11 +204,17 @@ void UpdateStrongholdOverlayState();
 
 // Snapshot for render thread drawing.
 StrongholdOverlayRenderSnapshot GetStrongholdOverlayRenderSnapshot();
+McsrApiTrackerRenderSnapshot GetMcsrApiTrackerRenderSnapshot();
+void RequestMcsrApiTrackerRefresh();
+void SetMcsrApiTrackerSearchPlayer(const std::string& playerName);
+void ClearMcsrApiTrackerSearchPlayer();
+bool ShouldAllowMcsrTrackerUiInput();
 
 // Hotkey handlers (called from input hook).
 // Returns true when handled and should consume the key event.
 bool HandleStrongholdOverlayHotkeyH(bool shiftDown, bool ctrlDown);
 bool HandleStrongholdOverlayNumpadHotkey(int virtualKey);
+bool HandleMcsrTrackerOverlayToggleHotkey(unsigned int keyVk, bool ctrlDown, bool shiftDown, bool altDown);
 
 // Runtime environment detection helpers.
 // MCSR-safe mode is auto-detected from launcher/instance path hints.

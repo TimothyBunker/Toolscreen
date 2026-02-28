@@ -6,9 +6,11 @@
 #include "imgui_impl_win32.h"
 #include "imgui_stdlib.h"
 #include "input_hook.h"
+#include "json.hpp"
 #include "logic_thread.h"
 #include "mirror_thread.h"
 #include "profiler.h"
+#include "practice_world_launch.h"
 #include "render.h"
 #include "render_thread.h"
 #include "resource.h"
@@ -25,6 +27,9 @@
 #include <cctype>
 #include <chrono>
 #include <commdlg.h>
+#include <cstring>
+#include <cstdio>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -318,6 +323,732 @@ static void ClearImageError(const std::string& key) {
     g_imageErrorMessages.erase(key);
     g_imageErrorTimes.erase(key);
 }
+
+struct BoatSetupScriptRunResult {
+    bool launched = false;
+    int exitCode = -1;
+    bool parsedOk = false;
+    std::string output;
+    std::string error;
+    nlohmann::json payload;
+};
+
+static void AddBoatScriptCandidate(std::vector<std::filesystem::path>& candidates, const std::filesystem::path& candidatePath) {
+    if (candidatePath.empty()) return;
+    std::error_code ec;
+    const std::filesystem::path normalized = candidatePath.lexically_normal();
+    for (const auto& existing : candidates) {
+        if (existing.lexically_normal() == normalized) return;
+    }
+    candidates.push_back(normalized);
+}
+
+static bool IsConfigHomeToolscreenPath(const std::filesystem::path& path) {
+    std::wstring s = path.lexically_normal().wstring();
+    if (s.empty()) return false;
+    std::replace(s.begin(), s.end(), L'/', L'\\');
+    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+    const std::wstring marker = L"\\.config\\toolscreen";
+    if (s.size() < marker.size()) return false;
+    return s.compare(s.size() - marker.size(), marker.size(), marker) == 0;
+}
+
+static void AddBoatScriptCandidatesFromAncestorChain(std::vector<std::filesystem::path>& candidates, const std::filesystem::path& startPath,
+                                                     int maxDepth = 10) {
+    if (startPath.empty()) return;
+
+    std::filesystem::path current = startPath;
+    for (int depth = 0; depth <= maxDepth && !current.empty(); ++depth) {
+        AddBoatScriptCandidate(candidates, current / L"scripts" / L"boat_eye_calibrate.ps1");
+        AddBoatScriptCandidate(candidates, current / L"Toolscreen" / L"scripts" / L"boat_eye_calibrate.ps1");
+        AddBoatScriptCandidate(candidates, current / L"toolscreen" / L"scripts" / L"boat_eye_calibrate.ps1");
+        const std::filesystem::path parent = current.parent_path();
+        if (parent == current) break;
+        current = parent;
+    }
+}
+
+static std::vector<std::filesystem::path> BuildBoatScriptCandidates(const std::wstring& toolscreenPath) {
+    std::vector<std::filesystem::path> candidates;
+
+    if (!toolscreenPath.empty()) {
+        const std::filesystem::path toolsPath(toolscreenPath);
+        // Avoid anchoring script lookup to ~/.config/toolscreen.
+        if (!IsConfigHomeToolscreenPath(toolsPath)) { AddBoatScriptCandidatesFromAncestorChain(candidates, toolsPath); }
+    }
+
+    wchar_t cwdBuf[MAX_PATH] = {};
+    if (GetCurrentDirectoryW(MAX_PATH, cwdBuf) > 0) { AddBoatScriptCandidatesFromAncestorChain(candidates, std::filesystem::path(cwdBuf)); }
+
+    HMODULE hModule = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&RegisterBindingInputEvent), &hModule) &&
+        hModule != nullptr) {
+        wchar_t modulePathBuf[MAX_PATH] = {};
+        if (GetModuleFileNameW(hModule, modulePathBuf, MAX_PATH) > 0) {
+            AddBoatScriptCandidatesFromAncestorChain(candidates, std::filesystem::path(modulePathBuf).parent_path());
+        }
+    }
+
+    wchar_t instDirBuf[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"INST_DIR", instDirBuf, MAX_PATH) > 0) {
+        AddBoatScriptCandidatesFromAncestorChain(candidates, std::filesystem::path(instDirBuf));
+    }
+
+    wchar_t instMcDirBuf[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"INST_MC_DIR", instMcDirBuf, MAX_PATH) > 0) {
+        AddBoatScriptCandidatesFromAncestorChain(candidates, std::filesystem::path(instMcDirBuf));
+    }
+
+    return candidates;
+}
+
+static bool TryResolveActiveMinecraftConfigPaths(std::wstring& outOptionsPath, std::wstring& outStandardSettingsPath) {
+    outOptionsPath.clear();
+    outStandardSettingsPath.clear();
+
+    auto normalizeLower = [](const std::filesystem::path& p) {
+        std::wstring s = p.lexically_normal().wstring();
+        std::transform(s.begin(), s.end(), s.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        return s;
+    };
+
+    std::vector<std::filesystem::path> optionCandidates;
+    std::vector<std::wstring> seen;
+    auto addCandidate = [&](const std::filesystem::path& p) {
+        if (p.empty()) return;
+        const std::wstring norm = normalizeLower(p);
+        if (std::find(seen.begin(), seen.end(), norm) != seen.end()) return;
+        seen.push_back(norm);
+        optionCandidates.push_back(p.lexically_normal());
+    };
+    auto addInstanceOptions = [&](const std::filesystem::path& base) {
+        addCandidate(base / L"options.txt");
+        addCandidate(base / L".minecraft" / L"options.txt");
+        addCandidate(base / L"minecraft" / L"options.txt");
+        addCandidate(base / L"game" / L"options.txt");
+    };
+
+    wchar_t instMcDirBuf[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"INST_MC_DIR", instMcDirBuf, MAX_PATH) > 0) {
+        addCandidate(std::filesystem::path(instMcDirBuf) / L"options.txt");
+    }
+    wchar_t instDirBuf[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"INST_DIR", instDirBuf, MAX_PATH) > 0) { addInstanceOptions(std::filesystem::path(instDirBuf)); }
+
+    if (!g_toolscreenPath.empty()) {
+        const std::filesystem::path toolPath(g_toolscreenPath);
+        addInstanceOptions(toolPath);
+        addInstanceOptions(toolPath.parent_path());
+    }
+
+    wchar_t cwdBuf[MAX_PATH] = {};
+    if (GetCurrentDirectoryW(MAX_PATH, cwdBuf) > 0) {
+        const std::filesystem::path cwd(cwdBuf);
+        addInstanceOptions(cwd);
+        addInstanceOptions(cwd.parent_path());
+    }
+
+    wchar_t userProfileBuf[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"USERPROFILE", userProfileBuf, MAX_PATH) > 0) {
+        const std::filesystem::path userRoot(userProfileBuf);
+        addCandidate(userRoot / L".minecraft" / L"options.txt");
+        addCandidate(userRoot / L"AppData" / L"Roaming" / L".minecraft" / L"options.txt");
+        addCandidate(userRoot / L"Desktop" / L"msr" / L"MultiMC" / L"instances" / L"MCSRRanked-Windows-1.16.1-All" / L".minecraft" /
+                     L"options.txt");
+    }
+
+    std::filesystem::path resolvedOptions;
+    std::filesystem::file_time_type latestWriteTime{};
+    bool foundOptions = false;
+    std::error_code ec;
+    // Prefer current process working directory first (active Minecraft instance).
+    wchar_t cwdPreferredBuf[MAX_PATH] = {};
+    if (GetCurrentDirectoryW(MAX_PATH, cwdPreferredBuf) > 0) {
+        const std::filesystem::path cwdPreferred = std::filesystem::path(cwdPreferredBuf) / L"options.txt";
+        ec.clear();
+        if (std::filesystem::exists(cwdPreferred, ec) && !ec && std::filesystem::is_regular_file(cwdPreferred, ec) && !ec) {
+            resolvedOptions = cwdPreferred.lexically_normal();
+            foundOptions = true;
+        }
+    }
+    for (const auto& candidate : optionCandidates) {
+        if (foundOptions) break;
+        ec.clear();
+        if (!std::filesystem::exists(candidate, ec) || ec) continue;
+        if (!std::filesystem::is_regular_file(candidate, ec) || ec) continue;
+        const auto wt = std::filesystem::last_write_time(candidate, ec);
+        if (!foundOptions || (!ec && wt > latestWriteTime)) {
+            resolvedOptions = candidate;
+            latestWriteTime = wt;
+            foundOptions = true;
+        }
+    }
+    if (!foundOptions) return false;
+    outOptionsPath = resolvedOptions.wstring();
+
+    std::vector<std::filesystem::path> stdCandidates;
+    std::vector<std::wstring> seenStd;
+    auto addStd = [&](const std::filesystem::path& p) {
+        if (p.empty()) return;
+        const std::wstring norm = normalizeLower(p);
+        if (std::find(seenStd.begin(), seenStd.end(), norm) != seenStd.end()) return;
+        seenStd.push_back(norm);
+        stdCandidates.push_back(p.lexically_normal());
+    };
+
+    const std::filesystem::path optionsDir = resolvedOptions.parent_path();
+    addStd(optionsDir / L"config" / L"mcsr" / L"standardsettings.json");
+    addStd(optionsDir / L"config" / L"standardsettings.json");
+    addStd(optionsDir / L".minecraft" / L"config" / L"mcsr" / L"standardsettings.json");
+    addStd(optionsDir / L".minecraft" / L"config" / L"standardsettings.json");
+
+    for (const auto& stdPath : stdCandidates) {
+        ec.clear();
+        if (!std::filesystem::exists(stdPath, ec) || ec) continue;
+        if (!std::filesystem::is_regular_file(stdPath, ec) || ec) continue;
+        outStandardSettingsPath = stdPath.wstring();
+        break;
+    }
+
+    return true;
+}
+
+static bool TryResolveBoatCalibrationScriptPath(const std::wstring& toolscreenPath, std::filesystem::path& outScriptPath,
+                                                std::string& outSearchedPaths) {
+    outScriptPath.clear();
+    outSearchedPaths.clear();
+
+    const auto candidates = BuildBoatScriptCandidates(toolscreenPath);
+    std::error_code ec;
+    for (const auto& candidate : candidates) {
+        if (std::filesystem::exists(candidate, ec) && !ec && std::filesystem::is_regular_file(candidate, ec) && !ec) {
+            outScriptPath = candidate;
+            return true;
+        }
+        if (!outSearchedPaths.empty()) outSearchedPaths += "\n";
+        outSearchedPaths += " - " + WideToUtf8(candidate.wstring());
+        ec.clear();
+    }
+
+    return false;
+}
+
+static std::wstring QuoteCommandArg(const std::wstring& input) {
+    std::wstring out;
+    out.reserve(input.size() + 2);
+    out.push_back(L'"');
+    for (wchar_t ch : input) {
+        if (ch == L'"') out.append(L"\\\"");
+        else out.push_back(ch);
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+static bool ParseBoatSetupJsonPayload(const std::string& rawOutput, nlohmann::json& outPayload, std::string& outError) {
+    auto tryParse = [&](const std::string& candidate) -> bool {
+        try {
+            outPayload = nlohmann::json::parse(candidate);
+            if (!outPayload.is_object()) {
+                outError = "Boat setup script output is not a JSON object.";
+                return false;
+            }
+            return true;
+        } catch (const std::exception& e) {
+            outError = std::string("JSON parse error: ") + e.what();
+            return false;
+        }
+    };
+
+    if (tryParse(rawOutput)) return true;
+
+    const size_t firstBrace = rawOutput.find('{');
+    const size_t lastBrace = rawOutput.rfind('}');
+    if (firstBrace != std::string::npos && lastBrace != std::string::npos && lastBrace > firstBrace) {
+        std::string maybeJson = rawOutput.substr(firstBrace, (lastBrace - firstBrace) + 1);
+        if (tryParse(maybeJson)) return true;
+    }
+
+    if (outError.empty()) outError = "Unable to locate JSON payload in script output.";
+    return false;
+}
+
+static std::string DecodeCapturedProcessOutput(const std::string& rawBytes) {
+    if (rawBytes.empty()) return std::string();
+
+    auto isLikelyUtf16Le = [](const std::string& bytes) -> bool {
+        if (bytes.size() >= 2) {
+            const unsigned char b0 = static_cast<unsigned char>(bytes[0]);
+            const unsigned char b1 = static_cast<unsigned char>(bytes[1]);
+            if (b0 == 0xFF && b1 == 0xFE) return true;
+        }
+        size_t oddZeroCount = 0;
+        size_t sampleCount = 0;
+        const size_t maxSamples = std::min<size_t>(bytes.size() / 2, 512);
+        for (size_t i = 0; i < maxSamples; ++i) {
+            const size_t oddIndex = i * 2 + 1;
+            if (oddIndex >= bytes.size()) break;
+            ++sampleCount;
+            if (bytes[oddIndex] == '\0') ++oddZeroCount;
+        }
+        return sampleCount >= 16 && (oddZeroCount * 100 / sampleCount) >= 60;
+    };
+
+    if (isLikelyUtf16Le(rawBytes)) {
+        size_t offset = 0;
+        if (rawBytes.size() >= 2 && static_cast<unsigned char>(rawBytes[0]) == 0xFF &&
+            static_cast<unsigned char>(rawBytes[1]) == 0xFE) {
+            offset = 2;
+        }
+        size_t payloadBytes = (rawBytes.size() > offset) ? (rawBytes.size() - offset) : 0;
+        payloadBytes &= ~static_cast<size_t>(1); // even byte count only
+        if (payloadBytes == 0) return std::string();
+
+        std::wstring w;
+        w.resize(payloadBytes / sizeof(wchar_t));
+        std::memcpy(w.data(), rawBytes.data() + offset, payloadBytes);
+        return WideToUtf8(w);
+    }
+
+    return rawBytes;
+}
+
+static bool RunHiddenProcessCapture(const std::wstring& commandLine, std::string& outOutput, int& outExitCode, std::string& outError) {
+    outOutput.clear();
+    outExitCode = -1;
+    outError.clear();
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = nullptr;
+
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) {
+        outError = "CreatePipe failed: " + std::to_string(GetLastError());
+        return false;
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdBuf(commandLine.begin(), commandLine.end());
+    cmdBuf.push_back(L'\0');
+
+    const BOOL created =
+        CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(writePipe);
+    writePipe = nullptr;
+
+    if (!created) {
+        CloseHandle(readPipe);
+        outError = "CreateProcessW failed: " + std::to_string(GetLastError());
+        return false;
+    }
+
+    std::string rawBytes;
+    char buffer[4096];
+    DWORD bytesRead = 0;
+    for (;;) {
+        const BOOL readOk = ReadFile(readPipe, buffer, static_cast<DWORD>(sizeof(buffer)), &bytesRead, nullptr);
+        if (!readOk) {
+            const DWORD readErr = GetLastError();
+            if (readErr == ERROR_BROKEN_PIPE) break;
+            outError = "ReadFile failed: " + std::to_string(readErr);
+            break;
+        }
+        if (bytesRead == 0) break;
+        rawBytes.append(buffer, buffer + bytesRead);
+    }
+    CloseHandle(readPipe);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    outExitCode = static_cast<int>(exitCode);
+    outOutput = DecodeCapturedProcessOutput(rawBytes);
+    return true;
+}
+
+static BoatSetupScriptRunResult RunBoatSetupCalibrationScript(const BoatSetupConfig& cfg, const std::wstring& toolscreenPath, bool apply) {
+    BoatSetupScriptRunResult result;
+
+    std::filesystem::path scriptPath;
+    std::string searchedPaths;
+    if (!TryResolveBoatCalibrationScriptPath(toolscreenPath, scriptPath, searchedPaths)) {
+        result.error = "Could not find boat_eye_calibrate.ps1 using relative lookup.";
+        if (!searchedPaths.empty()) { result.error += "\nSearched:\n" + searchedPaths; }
+        return result;
+    }
+
+    std::wstringstream cmd;
+    cmd.imbue(std::locale::classic());
+    cmd << L"powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "
+        << QuoteCommandArg(scriptPath.wstring());
+    std::wstring optionsPath;
+    std::wstring standardSettingsPath;
+    if (TryResolveActiveMinecraftConfigPaths(optionsPath, standardSettingsPath)) {
+        cmd << L" -OptionsPath " << QuoteCommandArg(optionsPath);
+        if (!standardSettingsPath.empty()) { cmd << L" -StandardSettingsPath " << QuoteCommandArg(standardSettingsPath); }
+    }
+    cmd << L" -CurrentDpi " << std::max(1, cfg.currentDpi);
+    cmd << L" -RecommendationMode " << (cfg.preferPixelPerfect ? L"pixel-perfect" : L"target-mapped");
+    cmd << L" -InputMode " << (cfg.usePreferredStandardSensitivity ? L"manual" : L"auto");
+    if (cfg.prioritizeLowestPixelSkipping) cmd << L" -PreferLowestPixelSkipping";
+    if (cfg.preferredCursorSpeed > 0) cmd << L" -TargetWindowsSpeed " << std::clamp(cfg.preferredCursorSpeed, 1, 20);
+    cmd << L" -RecommendationChoice " << std::clamp(cfg.recommendationChoice, 1, 12);
+    cmd << L" -LowestSkipChoiceOne " << (cfg.lowestSkipChoiceOne ? 1 : 0);
+    cmd << L" -IncludeCursorInRanking " << (cfg.includeCursorInRanking ? 1 : 0);
+    cmd << L" -PreferHigherDpi " << (cfg.preferHigherDpi ? 1 : 0);
+    cmd << L" -MaxRecommendedPixelSkipping " << std::clamp(static_cast<double>(cfg.maxRecommendedPixelSkipping), 0.1, 5000.0);
+    if (cfg.usePreferredStandardSensitivity) {
+        const double prefSens = std::clamp(static_cast<double>(cfg.preferredStandardSensitivity), 0.0, 1.0);
+        cmd << L" -PreferredStandardSensitivity " << prefSens;
+        cmd << L" -ManualCurrentWindowsSpeed " << std::clamp(cfg.manualCurrentWindowsSpeed, 1, 20);
+    }
+    if (!cfg.preferPixelPerfect) cmd << L" -TargetDpi " << std::max(1, cfg.legacyTargetDpi);
+    if (!cfg.disableMouseAccel) cmd << L" -NoDisableMouseAccel";
+    if (!cfg.enableRawInput) cmd << L" -NoEnableRawInput";
+    if (apply) cmd << L" -Apply";
+    cmd << L" -NoPopup -Json";
+
+    int exitCode = -1;
+    std::string procError;
+    if (!RunHiddenProcessCapture(cmd.str(), result.output, exitCode, procError)) {
+        result.error = procError.empty() ? "Failed to launch hidden powershell process for boat calibration." : procError;
+        return result;
+    }
+    result.launched = true;
+    result.exitCode = exitCode;
+
+    std::string parseError;
+    if (ParseBoatSetupJsonPayload(result.output, result.payload, parseError)) {
+        result.parsedOk = true;
+    } else {
+        result.error = parseError;
+    }
+
+    if (result.exitCode != 0) {
+        if (result.parsedOk && result.payload.contains("error") && result.payload["error"].is_string()) {
+            result.error = result.payload["error"].get<std::string>();
+        } else if (result.error.empty()) {
+            result.error = "Calibration script failed with exit code " + std::to_string(result.exitCode) + ".";
+        }
+    }
+
+    return result;
+}
+
+static BoatSetupScriptRunResult RunBoatSetupRestoreScript(const std::wstring& toolscreenPath) {
+    BoatSetupScriptRunResult result;
+
+    std::filesystem::path scriptPath;
+    std::string searchedPaths;
+    if (!TryResolveBoatCalibrationScriptPath(toolscreenPath, scriptPath, searchedPaths)) {
+        result.error = "Could not find boat_eye_calibrate.ps1 using relative lookup.";
+        if (!searchedPaths.empty()) { result.error += "\nSearched:\n" + searchedPaths; }
+        return result;
+    }
+
+    std::wstringstream cmd;
+    cmd.imbue(std::locale::classic());
+    cmd << L"powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "
+        << QuoteCommandArg(scriptPath.wstring());
+    std::wstring optionsPath;
+    std::wstring standardSettingsPath;
+    if (TryResolveActiveMinecraftConfigPaths(optionsPath, standardSettingsPath)) {
+        cmd << L" -OptionsPath " << QuoteCommandArg(optionsPath);
+        if (!standardSettingsPath.empty()) { cmd << L" -StandardSettingsPath " << QuoteCommandArg(standardSettingsPath); }
+    }
+    cmd << L" -RestoreLatestBackup -Apply -NoPopup -Json";
+
+    int exitCode = -1;
+    std::string procError;
+    if (!RunHiddenProcessCapture(cmd.str(), result.output, exitCode, procError)) {
+        result.error = procError.empty() ? "Failed to launch hidden powershell process for boat restore." : procError;
+        return result;
+    }
+    result.launched = true;
+    result.exitCode = exitCode;
+
+    std::string parseError;
+    if (ParseBoatSetupJsonPayload(result.output, result.payload, parseError)) {
+        result.parsedOk = true;
+    } else {
+        result.error = parseError;
+    }
+
+    if (result.exitCode != 0) {
+        if (result.parsedOk && result.payload.contains("error") && result.payload["error"].is_string()) {
+            result.error = result.payload["error"].get<std::string>();
+        } else if (result.error.empty()) {
+            result.error = "Boat restore script failed with exit code " + std::to_string(result.exitCode) + ".";
+        }
+    }
+
+    return result;
+}
+
+static bool ApplyVisualEffectsDirectFallback(const BoatSetupConfig& cfg, std::string& outError, std::wstring* outOptionsPath = nullptr,
+                                             std::wstring* outStandardSettingsPath = nullptr, std::wstring* outExtraOptionsPath = nullptr,
+                                             bool* outUpdatedStandardSettings = nullptr, bool* outUpdatedExtraOptions = nullptr);
+
+static BoatSetupScriptRunResult RunVisualEffectsApplyScript(const BoatSetupConfig& cfg, const std::wstring& toolscreenPath, bool apply) {
+    BoatSetupScriptRunResult result;
+    result.launched = true;
+    result.exitCode = 0;
+    result.parsedOk = true;
+
+    const double distortionScale = std::clamp(static_cast<double>(cfg.autoDistortionPercent) / 100.0, 0.0, 1.0);
+    const double fovScale = std::clamp(static_cast<double>(cfg.autoFovEffectPercent) / 100.0, 0.0, 1.0);
+    std::string directError;
+    std::wstring optionsPath;
+    std::wstring standardSettingsPath;
+    std::wstring extraOptionsPath;
+    bool updatedStandardSettings = false;
+    bool updatedExtraOptions = false;
+    const bool ok = apply
+                        ? ApplyVisualEffectsDirectFallback(cfg, directError, &optionsPath, &standardSettingsPath, &extraOptionsPath,
+                                                           &updatedStandardSettings, &updatedExtraOptions)
+                        : TryResolveActiveMinecraftConfigPaths(optionsPath, standardSettingsPath);
+
+    result.payload = nlohmann::json::object();
+    result.payload["ok"] = ok;
+    result.payload["mode"] = "visual-effects-only";
+    result.payload["optionsPath"] = WideToUtf8(optionsPath);
+    result.payload["standardSettingsPath"] = standardSettingsPath.empty() ? "" : WideToUtf8(standardSettingsPath);
+    result.payload["extraOptionsPath"] = extraOptionsPath.empty() ? "" : WideToUtf8(extraOptionsPath);
+    result.payload["apply"] = nlohmann::json::object();
+    result.payload["apply"]["requested"] = apply;
+    result.payload["apply"]["applied"] = apply && ok;
+    result.payload["apply"]["canceled"] = false;
+    result.payload["apply"]["targetScreenEffectScale"] = distortionScale;
+    result.payload["apply"]["targetFovEffectScale"] = fovScale;
+    result.payload["apply"]["message"] = ok ? (apply ? "Visual effects applied." : "Resolved visual effects targets.")
+                                            : (directError.empty() ? "Visual effects apply failed." : directError);
+    result.payload["apply"]["after"] = nlohmann::json::object();
+    result.payload["apply"]["after"]["screenEffectScale"] = distortionScale;
+    result.payload["apply"]["after"]["fovEffectScale"] = fovScale;
+    result.payload["apply"]["after"]["standardSettingsUpdated"] = updatedStandardSettings;
+    result.payload["apply"]["after"]["extraOptionsUpdated"] = updatedExtraOptions;
+
+    if (!ok) {
+        result.exitCode = 1;
+        result.error = directError.empty() ? "Visual effects direct apply failed." : directError;
+        result.payload["error"] = result.error;
+    }
+    return result;
+}
+
+static bool ApplyVisualEffectsDirectFallback(const BoatSetupConfig& cfg, std::string& outError) {
+    return ApplyVisualEffectsDirectFallback(cfg, outError, nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
+static bool ApplyVisualEffectsDirectFallback(const BoatSetupConfig& cfg, std::string& outError, std::wstring* outOptionsPath,
+                                             std::wstring* outStandardSettingsPath, std::wstring* outExtraOptionsPath,
+                                             bool* outUpdatedStandardSettings, bool* outUpdatedExtraOptions) {
+    outError.clear();
+    if (outOptionsPath) outOptionsPath->clear();
+    if (outStandardSettingsPath) outStandardSettingsPath->clear();
+    if (outExtraOptionsPath) outExtraOptionsPath->clear();
+    if (outUpdatedStandardSettings) *outUpdatedStandardSettings = false;
+    if (outUpdatedExtraOptions) *outUpdatedExtraOptions = false;
+
+    std::wstring optionsPath;
+    std::wstring standardSettingsPath;
+    if (!TryResolveActiveMinecraftConfigPaths(optionsPath, standardSettingsPath)) {
+        outError = "Could not resolve active Minecraft options path.";
+        return false;
+    }
+    if (outOptionsPath) *outOptionsPath = optionsPath;
+    if (outStandardSettingsPath) *outStandardSettingsPath = standardSettingsPath;
+
+    const double distortionScale = std::clamp(static_cast<double>(cfg.autoDistortionPercent) / 100.0, 0.0, 1.0);
+    const double fovScale = std::clamp(static_cast<double>(cfg.autoFovEffectPercent) / 100.0, 0.0, 1.0);
+
+    auto formatScaleValue = [](double value) {
+        std::string s = std::to_string(value);
+        while (s.size() > 1 && s.back() == '0') s.pop_back();
+        if (!s.empty() && s.back() == '.') s.push_back('0');
+        if (s.empty()) s = "0.0";
+        return s;
+    };
+
+    auto applyOption = [](std::vector<std::string>& lines, const std::string& key, const std::string& value) {
+        const std::string prefix = key + ":";
+        bool updated = false;
+        for (std::string& line : lines) {
+            if (line.rfind(prefix, 0) == 0) {
+                line = prefix + value;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) lines.push_back(prefix + value);
+    };
+
+    try {
+        std::ifstream in(optionsPath, std::ios::binary);
+        if (!in.is_open()) {
+            outError = "Failed to open options.txt for fallback apply: " + WideToUtf8(optionsPath);
+            return false;
+        }
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+
+        bool hasUtf8Bom = (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xEF &&
+                           static_cast<unsigned char>(bytes[1]) == 0xBB && static_cast<unsigned char>(bytes[2]) == 0xBF);
+        if (hasUtf8Bom) bytes.erase(0, 3);
+
+        std::vector<std::string> lines;
+        std::istringstream iss(bytes);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(line);
+        }
+
+        applyOption(lines, "screenEffectScale", formatScaleValue(distortionScale));
+        applyOption(lines, "fovEffectScale", formatScaleValue(fovScale));
+        // Some 1.16 MCSR setups mirror distortion in a modded key name.
+        applyOption(lines, "distortionEffectScale", formatScaleValue(distortionScale));
+
+        std::ofstream out(optionsPath, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            outError = "Failed to write options.txt for fallback apply: " + WideToUtf8(optionsPath);
+            return false;
+        }
+        if (hasUtf8Bom) out.write("\xEF\xBB\xBF", 3);
+        for (size_t i = 0; i < lines.size(); ++i) {
+            out << lines[i];
+            if (i + 1 < lines.size()) out << "\n";
+        }
+        out.close();
+    } catch (const std::exception& e) {
+        outError = std::string("Fallback options apply failed: ") + e.what();
+        return false;
+    } catch (...) {
+        outError = "Fallback options apply failed with unknown error.";
+        return false;
+    }
+
+    if (!standardSettingsPath.empty()) {
+        try {
+            std::ifstream jsIn(standardSettingsPath, std::ios::binary);
+            if (jsIn.is_open()) {
+                nlohmann::json j;
+                jsIn >> j;
+                jsIn.close();
+                if (!j.is_object()) j = nlohmann::json::object();
+                j["screenEffectScale"] = distortionScale;
+                j["distortionEffectScale"] = distortionScale;
+                j["fovEffectScale"] = fovScale;
+
+                std::ofstream jsOut(standardSettingsPath, std::ios::binary | std::ios::trunc);
+                if (jsOut.is_open()) {
+                    jsOut << j.dump(2) << "\n";
+                    jsOut.close();
+                    if (outUpdatedStandardSettings) *outUpdatedStandardSettings = true;
+                }
+            }
+        } catch (...) {
+            // Non-fatal for fallback; options.txt is the primary runtime source.
+        }
+    }
+
+    // MCSR 1.16.1 helper mod stores accessibility scales here.
+    try {
+        const std::filesystem::path extraPath = std::filesystem::path(optionsPath).parent_path() / L"config" / L"mcsr" / L"extra-options.json";
+        if (outExtraOptionsPath) *outExtraOptionsPath = extraPath.wstring();
+        std::error_code ec;
+        if (std::filesystem::exists(extraPath, ec) && !ec && std::filesystem::is_regular_file(extraPath, ec) && !ec) {
+            std::ifstream exIn(extraPath, std::ios::binary);
+            if (exIn.is_open()) {
+                nlohmann::json ex;
+                exIn >> ex;
+                exIn.close();
+                if (!ex.is_object()) ex = nlohmann::json::object();
+                ex["distortionEffectScale"] = distortionScale;
+                ex["screenEffectScale"] = distortionScale;
+                ex["fovEffectScale"] = fovScale;
+                std::ofstream exOut(extraPath, std::ios::binary | std::ios::trunc);
+                if (exOut.is_open()) {
+                    exOut << ex.dump(2) << "\n";
+                    exOut.close();
+                    if (outUpdatedExtraOptions) *outUpdatedExtraOptions = true;
+                }
+            }
+        }
+    } catch (...) {
+        // Non-fatal; file may not exist on non-MCSR setups.
+    }
+
+    return true;
+}
+
+static std::atomic<bool> s_visualEffectsApplyInFlight{ false };
+static std::atomic<ULONGLONG> s_visualEffectsLastRequestMs{ 0 };
+
+static void TriggerVisualEffectsApply(const char* reasonTag) {
+    BoatSetupConfig cfg = g_config.boatSetup;
+    if (auto cfgSnap = GetConfigSnapshot(); cfgSnap) { cfg = cfgSnap->boatSetup; }
+    if (!cfg.autoApplyVisualEffects) return;
+
+    const ULONGLONG nowMs = GetTickCount64();
+    const ULONGLONG lastMs = s_visualEffectsLastRequestMs.load(std::memory_order_relaxed);
+    if (lastMs != 0 && nowMs > lastMs && (nowMs - lastMs) < 2500) return;
+    s_visualEffectsLastRequestMs.store(nowMs, std::memory_order_relaxed);
+
+    if (s_visualEffectsApplyInFlight.exchange(true, std::memory_order_acq_rel)) return;
+
+    const std::string reason = reasonTag ? std::string(reasonTag) : std::string("unknown");
+    const std::wstring toolsPath = g_toolscreenPath;
+    std::thread([cfg, toolsPath, reason]() {
+        BoatSetupScriptRunResult result = RunVisualEffectsApplyScript(cfg, toolsPath, true);
+        if (result.exitCode == 0 && result.parsedOk && result.payload.value("ok", false)) {
+            const std::string optionsPath = result.payload.value("optionsPath", "");
+            const std::string extraPath = result.payload.value("extraOptionsPath", "");
+            const bool stdUpdated =
+                result.payload.contains("apply") && result.payload["apply"].contains("after") &&
+                result.payload["apply"]["after"].value("standardSettingsUpdated", false);
+            const bool extraUpdated =
+                result.payload.contains("apply") && result.payload["apply"].contains("after") &&
+                result.payload["apply"]["after"].value("extraOptionsUpdated", false);
+            std::ostringstream oss;
+            oss << "Visual effects apply (" << reason << ") completed."
+                << " options=" << (optionsPath.empty() ? "<unknown>" : optionsPath)
+                << " stdUpdated=" << (stdUpdated ? "true" : "false")
+                << " extraUpdated=" << (extraUpdated ? "true" : "false");
+            if (!extraPath.empty()) oss << " extraPath=" << extraPath;
+            Log(oss.str());
+            s_visualEffectsApplyInFlight.store(false, std::memory_order_release);
+            return;
+        }
+        std::string err = result.error;
+        if (err.empty() && result.parsedOk && result.payload.contains("apply") && result.payload["apply"].is_object()) {
+            err = result.payload["apply"].value("message", "");
+        }
+        if (err.empty()) err = "unknown error";
+        Log("Visual effects apply (" + reason + ") failed: " + err);
+        s_visualEffectsApplyInFlight.store(false, std::memory_order_release);
+    }).detach();
+}
+
+void RequestVisualEffectsApplyOnWorldEnter() { TriggerVisualEffectsApply("world-enter"); }
+
+static void MaybeApplyVisualEffectsOnGameStartup() { TriggerVisualEffectsApply("session-startup"); }
 
 // Helper to display a little (?) mark which shows a tooltip when hovered
 static void HelpMarker(const char* desc) {
@@ -2645,92 +3376,47 @@ void RenderSettingsGUI() {
 
         ImGui::Separator();
 
-        // --- BASIC/ADVANCED MODE TOGGLE ---
-        {
-            bool isAdvanced = !g_config.basicModeEnabled;
-            if (ImGui::RadioButton("Basic", !isAdvanced)) {
-                g_config.basicModeEnabled = true;
-                g_configIsDirty = true;
-            }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("Advanced", isAdvanced)) {
-                g_config.basicModeEnabled = false;
-                g_configIsDirty = true;
-            }
+        // Standalone GUI is basic-only.
+        if (!g_config.basicModeEnabled) {
+            g_config.basicModeEnabled = true;
+            g_configIsDirty = true;
         }
 
-        ImGui::Separator();
-
-        if (g_config.basicModeEnabled) {
-            // --- BASIC MODE: Only General and Other tabs ---
-            if (ImGui::BeginTabBar("BasicSettingsTabs")) {
-                // =====================================================================
-                // BASIC GENERAL TAB - Simplified mode selection with inline hotkeys
-                // =====================================================================
+        if (ImGui::BeginTabBar("BasicSettingsTabs")) {
+            // =====================================================================
+            // BASIC GENERAL TAB - Simplified mode selection with inline hotkeys
+            // =====================================================================
 #include "gui/tab_basic_general.inl"
-                // =====================================================================
-                // BASIC STRONGHOLD TAB - Stronghold overlay settings
-                // =====================================================================
+            // =====================================================================
+            // BASIC STRONGHOLD TAB - Stronghold overlay settings
+            // =====================================================================
 #include "gui/tab_basic_stronghold.inl"
-                // =====================================================================
-                // BASIC NOTES TAB - Notes overlay settings
-                // =====================================================================
+            // =====================================================================
+            // BASIC BOAT TAB - Boat-eye setup helper (pixel-perfect recommendations)
+            // =====================================================================
+#include "gui/tab_basic_boat.inl"
+            // =====================================================================
+            // BASIC PRACTICE TAB - Practice map catalog + persistent map library
+            // =====================================================================
+#include "gui/tab_basic_practice.inl"
+            // =====================================================================
+            // BASIC MCSR TAB - MCSR stats/splits tracker overlay settings
+            // =====================================================================
+#include "gui/tab_basic_mcsr.inl"
+            // =====================================================================
+            // BASIC NOTES TAB - Notes overlay settings
+            // =====================================================================
 #include "gui/tab_basic_notes.inl"
-                // =====================================================================
-                // BASIC MACROS TAB - Macro controls and F3 rebind
-                // =====================================================================
+            // =====================================================================
+            // BASIC MACROS TAB - Macro controls and F3 rebind
+            // =====================================================================
 #include "gui/tab_basic_macros.inl"
-                // =====================================================================
-                // BASIC OTHER TAB - Miscellaneous settings
-                // =====================================================================
+            // =====================================================================
+            // BASIC OTHER TAB - Miscellaneous settings
+            // =====================================================================
 #include "gui/tab_basic_other.inl"
 
-                ImGui::EndTabBar();
-            }
-        } else {
-            // --- ADVANCED MODE: All tabs ---
-            if (ImGui::BeginTabBar("SettingsTabs")) {
-                // =====================================================================
-                // MODES TAB - Extracted to gui/tab_modes.inl
-                // =====================================================================
-#include "gui/tab_modes.inl"
-                // =====================================================================
-                // MIRRORS TAB - Extracted to gui/tab_mirrors.inl
-                // =====================================================================
-#include "gui/tab_mirrors.inl"
-                // =====================================================================
-                // IMAGES TAB - Extracted to gui/tab_images.inl
-                // =====================================================================
-#include "gui/tab_images.inl"
-                // =====================================================================
-                // WINDOW OVERLAYS TAB - Extracted to gui/tab_window_overlays.inl
-                // =====================================================================
-#include "gui/tab_window_overlays.inl"
-                // =====================================================================
-                // HOTKEYS TAB - Extracted to gui/tab_hotkeys.inl
-                // =====================================================================
-#include "gui/tab_hotkeys.inl"
-                // =====================================================================
-                // INPUTS TAB - Contains Mouse and Keyboard sub-tabs
-                // =====================================================================
-#include "gui/tab_inputs.inl"
-                // =====================================================================
-                // SETTINGS TAB - Extracted to gui/tab_settings.inl
-                // =====================================================================
-#include "gui/tab_settings.inl"
-
-                // =====================================================================
-                // APPEARANCE TAB - GUI color scheme configuration
-                // =====================================================================
-#include "gui/tab_appearance.inl"
-
-                // =====================================================================
-                // MISC TAB - Extracted to gui/tab_misc.inl
-                // =====================================================================
-#include "gui/tab_misc.inl"
-
-                ImGui::EndTabBar();
-            }
+            ImGui::EndTabBar();
         }
 
     } else {

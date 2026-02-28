@@ -1042,6 +1042,14 @@ std::string ResolveIgnPreviewTitle(const NotesOverlayState& st) {
     return "IGN Note";
 }
 
+std::string ResolveIgnDraftSaveTitle(const NotesOverlayState& st, const std::filesystem::path& ignFolder) {
+    std::string titleFromMarkdown = SanitizeFileComponent(ExtractMarkdownTitle(st.ignDraft));
+    std::string titleFromPath = SanitizeFileComponent(GuessTitleFromPath(st.ignEditingPath));
+    std::string title = HasMeaningfulText(titleFromMarkdown) ? titleFromMarkdown : titleFromPath;
+    if (title.empty() || title == "note") { title = BuildNextUntitledTitle(ignFolder); }
+    return title;
+}
+
 std::string ResolveGeneralPreviewTitle(const NotesOverlayState& st) {
     if (HasMeaningfulText(st.generalTitle)) return TrimAscii(st.generalTitle);
     if (!st.generalEditingPath.empty()) {

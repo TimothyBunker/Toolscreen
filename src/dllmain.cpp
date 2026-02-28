@@ -138,6 +138,7 @@ std::atomic<bool> g_configLoadFailed{ false };
 std::atomic<bool> g_configLoaded{ false }; // Set to true once LoadConfig() completes successfully
 std::map<std::string, std::chrono::steady_clock::time_point> g_hotkeyTimestamps;
 std::atomic<bool> g_guiNeedsRecenter{ true };
+std::atomic<bool> g_captureCursorOnWorldEnter{ false };
 std::atomic<bool> g_wasCursorVisible{ true };
 // Lock-free GUI toggle debounce timestamp
 std::atomic<int64_t> g_lastGuiToggleTimeMs{ 0 };

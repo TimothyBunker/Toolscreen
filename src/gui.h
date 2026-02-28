@@ -458,6 +458,50 @@ struct StrongholdOverlayConfig {
     float backgroundOpacity = 0.55f;     // Panel background alpha multiplier
     int pollIntervalMs = 125;            // API polling interval
 };
+struct McsrTrackerOverlayConfig {
+    bool enabled = false;              // Master toggle for MCSR tracker overlay feature
+    bool visible = false;              // Startup visibility (hidden by default)
+    bool renderInGameOverlay = true;   // Render tracker card on game view
+    bool autoDetectPlayer = true;      // Auto-grab Minecraft account username from latest.log
+    std::string player;                // Manual MCSR username search/override
+    bool refreshOnlyMode = true;       // If true, poll only on manual refresh or identifier changes
+    bool useApiKey = false;            // Include API key header for expanded ratelimit
+    std::string apiKeyHeader = "x-api-key"; // Header name for API key
+    std::string apiKey;                // API key value (from MCSR ticket)
+    int pollIntervalMs = 15000;        // API polling interval
+    bool hotkeyCtrl = true;            // Toggle hotkey requires Ctrl
+    bool hotkeyShift = true;           // Toggle hotkey requires Shift
+    bool hotkeyAlt = false;            // Toggle hotkey requires Alt
+    int hotkeyKey = 'U';               // Toggle hotkey key virtual-key code
+    int x = 0;                         // Overlay X offset from top-right anchor
+    int y = 0;                         // Overlay Y offset from top-right anchor
+    float scale = 1.0f;                // UI scale multiplier
+    float opacity = 1.0f;              // Text/border opacity multiplier
+    float backgroundOpacity = 0.55f;   // Panel background alpha multiplier
+};
+struct BoatSetupConfig {
+    bool enabled = true;                // Enable boat-eye setup helper tab/workflow
+    bool preferPixelPerfect = true;     // True = use pixel-perfect recommendation as primary
+    bool prioritizeLowestPixelSkipping = true;  // Pixel-perfect auto policy is enforced to lowest skipping
+    int currentDpi = 800;               // User-entered current DPI
+    int preferredCursorSpeed = 0;       // 0 = auto; 1-20 = preferred Windows cursor speed
+    int manualCurrentWindowsSpeed = 10; // Manual mode only: current Windows pointer speed baseline (1-20)
+    int recommendationChoice = 1;       // 1 = best (lowest skip), higher = alternate ranked choices
+    bool lowestSkipChoiceOne = true;    // If true, rank #1 is always strict lowest skip
+    bool includeCursorInRanking = true; // Include cursor-speed distance in recommendation ranking
+    bool preferHigherDpi = false;       // Bias recommendations toward higher DPI when otherwise comparable
+    float maxRecommendedPixelSkipping = 50.0f; // Exclude candidates above this skip threshold (fallbacks if none)
+    bool autoTrackPreferredStandardSensitivity = true; // Auto mode helper: keep manual input value synced from detected standardsettings
+    bool usePreferredStandardSensitivity = false;      // Input mode: true = use manual preferredStandardSensitivity as current baseline
+    float preferredStandardSensitivity = 0.0f;         // Manual input baseline sensitivity in [0,1]
+    float appliedRecommendedSensitivity = -1.0f;       // Last successfully applied boat recommendation sensitivity in [0,1], -1 = unset
+    bool autoApplyVisualEffects = true;                // Apply distortion/FOV effect scale values once on game startup
+    int autoDistortionPercent = 0;                     // Distortion effect scale target in MC percent (0-100)
+    int autoFovEffectPercent = 10;                     // FOV effect scale target in MC percent (0-100)
+    int legacyTargetDpi = 800;          // Target DPI for legacy target-mapped mode
+    bool disableMouseAccel = true;      // Apply disabling Windows mouse acceleration
+    bool enableRawInput = true;         // Apply enabling Minecraft rawMouseInput
+};
 struct NotesOverlayConfig {
     bool enabled = true;             // Master toggle for notes overlay feature
     bool visible = false;            // Startup visibility (hidden by default)
@@ -496,11 +540,13 @@ struct Config {
     bool hideAnimationsInGame = false;                      // Show transition animations only on OBS, not in-game
     KeyRebindsConfig keyRebinds;                            // Key rebinding configuration
     StrongholdOverlayConfig strongholdOverlay;              // Native stronghold direction overlay
+    McsrTrackerOverlayConfig mcsrTrackerOverlay;            // MCSR Ranked stats/splits overlay
+    BoatSetupConfig boatSetup;                              // Boat-eye pixel-perfect setup helper
     NotesOverlayConfig notesOverlay;                        // Notes overlay (IGN + General notes)
     AppearanceConfig appearance;                            // GUI color scheme configuration
     int keyRepeatStartDelay = 0;                            // Key repeat start delay (0 = disabled, 1-500ms = custom)
     int keyRepeatDelay = 0;                                 // Key repeat delay between repeats (0 = disabled, 1-500ms = custom)
-    bool basicModeEnabled = false;                          // true = Basic mode GUI, false = Advanced mode GUI (default)
+    bool basicModeEnabled = true;                           // Basic-only GUI mode (advanced UI hidden in this branch)
     bool disableFullscreenPrompt = true;                    // Disable fullscreen toast prompt (toast2)
     bool disableConfigurePrompt = true;                     // Disable configure toast prompt (toast1)
 };
@@ -634,6 +680,7 @@ extern std::wstring g_modeFilePath;
 extern std::atomic<bool> g_configLoadFailed;
 extern std::map<std::string, std::chrono::steady_clock::time_point> g_hotkeyTimestamps;
 extern std::atomic<bool> g_guiNeedsRecenter;
+extern std::atomic<bool> g_captureCursorOnWorldEnter;
 // Lock-free GUI toggle debounce timestamp (milliseconds since epoch)
 extern std::atomic<int64_t> g_lastGuiToggleTimeMs;
 
@@ -761,6 +808,7 @@ void RenderWelcomeToast(bool isFullscreen);
 
 void HandleConfigLoadFailed(HDC hDc, BOOL (*oWglSwapBuffers)(HDC));
 void RenderImGuiWithStateProtection(bool useFullProtection);
+void RequestVisualEffectsApplyOnWorldEnter();
 void SaveConfig();
 void SaveConfigImmediate();   // Force immediate save, bypassing throttle
 void ApplyAppearanceConfig(); // Apply the saved theme and custom colors to ImGui

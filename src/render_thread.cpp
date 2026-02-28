@@ -12,7 +12,11 @@
 #include "virtual_camera.h"
 #include "window_overlay.h"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <set>
 #include <sstream>
@@ -358,6 +362,131 @@ static ImU32 RT_CertaintyHeatColor(float certaintyPercent, int alpha) {
     }
     return IM_COL32(static_cast<int>(std::lround(r)), static_cast<int>(std::lround(g)), static_cast<int>(std::lround(b)),
                     std::clamp(alpha, 0, 255));
+}
+
+struct McsrTextureCacheEntry {
+    GLuint textureId = 0;
+    std::string sourcePathUtf8;
+    std::filesystem::file_time_type lastWriteTime{};
+    bool hasLastWriteTime = false;
+    int width = 0;
+    int height = 0;
+    ImVec2 uvMin = ImVec2(0.0f, 0.0f);
+    ImVec2 uvMax = ImVec2(1.0f, 1.0f);
+};
+
+static McsrTextureCacheEntry g_mcsrAvatarTextureCache;
+static McsrTextureCacheEntry g_mcsrFlagTextureCache;
+
+static void RT_ClearMcsrTextureCacheEntry(McsrTextureCacheEntry& entry) {
+    if (entry.textureId != 0) {
+        glDeleteTextures(1, &entry.textureId);
+        entry.textureId = 0;
+    }
+    entry.sourcePathUtf8.clear();
+    entry.hasLastWriteTime = false;
+    entry.width = 0;
+    entry.height = 0;
+    entry.uvMin = ImVec2(0.0f, 0.0f);
+    entry.uvMax = ImVec2(1.0f, 1.0f);
+}
+
+static bool RT_EnsureMcsrTextureFromFile(const std::string& pathUtf8, McsrTextureCacheEntry& entry) {
+    if (pathUtf8.empty()) {
+        RT_ClearMcsrTextureCacheEntry(entry);
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path filePath = std::filesystem::path(Utf8ToWide(pathUtf8));
+    if (!std::filesystem::exists(filePath, ec) || ec || !std::filesystem::is_regular_file(filePath, ec) || ec) {
+        RT_ClearMcsrTextureCacheEntry(entry);
+        return false;
+    }
+    const auto writeTime = std::filesystem::last_write_time(filePath, ec);
+    const bool haveWriteTime = !ec;
+    const bool needsReload = (entry.textureId == 0) || (entry.sourcePathUtf8 != pathUtf8) ||
+                             (haveWriteTime != entry.hasLastWriteTime) ||
+                             (haveWriteTime && entry.hasLastWriteTime && writeTime != entry.lastWriteTime);
+    if (!needsReload) return true;
+
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) {
+        RT_ClearMcsrTextureCacheEntry(entry);
+        return false;
+    }
+    file.seekg(0, std::ios::end);
+    const std::streamoff size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    if (size <= 0) {
+        RT_ClearMcsrTextureCacheEntry(entry);
+        return false;
+    }
+    std::vector<unsigned char> bytes(static_cast<size_t>(size));
+    file.read(reinterpret_cast<char*>(bytes.data()), size);
+    if (!file.good() && !file.eof()) {
+        RT_ClearMcsrTextureCacheEntry(entry);
+        return false;
+    }
+
+    int w = 0;
+    int h = 0;
+    int channels = 0;
+    unsigned char* pixels =
+        stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, STBI_rgb_alpha);
+    if (!pixels || w <= 0 || h <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        RT_ClearMcsrTextureCacheEntry(entry);
+        return false;
+    }
+
+    if (entry.textureId == 0) glGenTextures(1, &entry.textureId);
+    glBindTexture(GL_TEXTURE_2D, entry.textureId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    int minX = w;
+    int minY = h;
+    int maxX = -1;
+    int maxY = -1;
+    for (int y = 0; y < h; ++y) {
+        const unsigned char* row = pixels + (static_cast<size_t>(y) * static_cast<size_t>(w) * 4ull);
+        for (int x = 0; x < w; ++x) {
+            const unsigned char a = row[static_cast<size_t>(x) * 4ull + 3ull];
+            if (a < 6) continue;
+            minX = std::min(minX, x);
+            minY = std::min(minY, y);
+            maxX = std::max(maxX, x);
+            maxY = std::max(maxY, y);
+        }
+    }
+    stbi_image_free(pixels);
+
+    entry.sourcePathUtf8 = pathUtf8;
+    entry.lastWriteTime = writeTime;
+    entry.hasLastWriteTime = haveWriteTime;
+    entry.width = w;
+    entry.height = h;
+    if (maxX >= minX && maxY >= minY) {
+        const float fx0 = static_cast<float>(std::max(0, minX)) / static_cast<float>(std::max(1, w));
+        const float fy0 = static_cast<float>(std::max(0, minY)) / static_cast<float>(std::max(1, h));
+        const float fx1 = static_cast<float>(std::min(w, maxX + 1)) / static_cast<float>(std::max(1, w));
+        const float fy1 = static_cast<float>(std::min(h, maxY + 1)) / static_cast<float>(std::max(1, h));
+        if ((fx1 - fx0) > 0.1f && (fy1 - fy0) > 0.1f) {
+            entry.uvMin = ImVec2(fx0, fy0);
+            entry.uvMax = ImVec2(fx1, fy1);
+        } else {
+            entry.uvMin = ImVec2(0.0f, 0.0f);
+            entry.uvMax = ImVec2(1.0f, 1.0f);
+        }
+    } else {
+        entry.uvMin = ImVec2(0.0f, 0.0f);
+        entry.uvMax = ImVec2(1.0f, 1.0f);
+    }
+    return true;
 }
 
 static void DrawBoatIconImGui(ImDrawList* drawList, const ImVec2& center, float size, ImU32 boatColor, ImU32 strokeColor) {
@@ -1420,6 +1549,898 @@ static void RT_RenderStrongholdOverlayImGui(const StrongholdOverlayRenderSnapsho
     }
 }
 
+static void RT_RenderMcsrApiTrackerOverlayImGui(const McsrApiTrackerRenderSnapshot& snap, bool drawBehindGui) {
+    if (!snap.enabled || !snap.visible) return;
+    if (!ImGui::GetCurrentContext()) return;
+
+    const float uiScale = std::clamp(snap.scale, 0.6f, 2.2f);
+    const float overlayOpacity = std::clamp(snap.overlayOpacity, 0.4f, 1.0f);
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const std::string gameState = g_gameStateBuffers[g_currentGameStateIndex.load(std::memory_order_acquire)];
+    const bool isInWorld = gameState.find("inworld") != std::string::npos;
+    static double s_apiDownSinceSec = -1.0;
+    const double nowSec = ImGui::GetTime();
+    if (snap.apiOnline) {
+        s_apiDownSinceSec = -1.0;
+    } else if (s_apiDownSinceSec < 0.0) {
+        s_apiDownSinceSec = nowSec;
+    }
+    const bool showApiDownWarning = (!snap.apiOnline && s_apiDownSinceSec >= 0.0 && (nowSec - s_apiDownSinceSec) >= 45.0);
+    const std::string statusLabelForDisplay = showApiDownWarning ? (snap.statusLabel.empty() ? "MCSR API unavailable." : snap.statusLabel) : "";
+
+    // In-game path: compact non-interactive HUD.
+    // Out-of-game path: full tracker panel.
+    if (isInWorld) {
+        ImDrawList* dl = drawBehindGui ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
+        if (!dl) return;
+
+        const float panelW = std::clamp(display.x * 0.44f, 620.0f * uiScale, 980.0f * uiScale);
+        const float panelH = 112.0f * uiScale;
+        const float x = std::clamp(display.x - panelW - (24.0f * uiScale) + static_cast<float>(snap.x), 0.0f,
+                                   std::max(0.0f, display.x - panelW));
+        const float y = std::clamp((24.0f * uiScale) + static_cast<float>(snap.y), 0.0f, std::max(0.0f, display.y - panelH));
+        const ImVec2 p0(x, y);
+        const ImVec2 p1(x + panelW, y + panelH);
+        const ImU32 bg = IM_COL32(12, 18, 30, static_cast<int>(235.0f * overlayOpacity));
+        const ImU32 border = IM_COL32(70, 92, 132, static_cast<int>(235.0f * overlayOpacity));
+        const ImU32 title = IM_COL32(225, 236, 255, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 body = IM_COL32(198, 210, 236, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 muted = IM_COL32(140, 156, 186, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 warn = IM_COL32(255, 170, 170, static_cast<int>(255.0f * overlayOpacity));
+
+        auto formatDurationMs = [](int durationMs) -> std::string {
+            if (durationMs <= 0) return "--:--.--";
+            const int totalSeconds = durationMs / 1000;
+            const int minutes = totalSeconds / 60;
+            const int seconds = totalSeconds % 60;
+            const int centiseconds = (durationMs % 1000) / 10;
+            std::ostringstream out;
+            out << std::setfill('0') << std::setw(2) << minutes << ":" << std::setw(2) << seconds << "." << std::setw(2)
+                << centiseconds;
+            return out.str();
+        };
+
+        const std::string player = !snap.displayPlayer.empty() ? snap.displayPlayer :
+                                   (!snap.requestedPlayer.empty() ? snap.requestedPlayer :
+                                    (!snap.headerLabel.empty() ? snap.headerLabel : "MCSR"));
+
+        dl->AddRectFilled(p0, p1, bg, 7.0f * uiScale);
+        dl->AddRect(p0, p1, border, 7.0f * uiScale, 0, std::max(1.0f, 1.2f * uiScale));
+        dl->AddText(ImVec2(p0.x + 10.0f * uiScale, p0.y + 8.0f * uiScale), title,
+                    (std::string("#") + std::to_string(std::max(0, snap.eloRank)) + " " + player).c_str());
+        dl->AddText(ImVec2(p0.x + 10.0f * uiScale, p0.y + 30.0f * uiScale), body,
+                    (std::to_string(std::max(0, snap.eloRate)) + " elo  peak " + std::to_string(std::max(0, snap.peakElo))).c_str());
+        dl->AddText(ImVec2(p0.x + 10.0f * uiScale, p0.y + 50.0f * uiScale), body,
+                    (std::to_string(std::max(0, snap.seasonWins)) + "W " + std::to_string(std::max(0, snap.seasonLosses)) + "L  pb " +
+                     formatDurationMs(snap.bestTimeMs))
+                        .c_str());
+        if (snap.apiOnline) {
+            dl->AddText(ImVec2(p0.x + 10.0f * uiScale, p0.y + 70.0f * uiScale), muted, "Press Ctrl+I to move/resize/search.");
+        } else if (showApiDownWarning) {
+            dl->AddText(ImVec2(p0.x + 10.0f * uiScale, p0.y + 70.0f * uiScale), warn, "MCSR API has been unavailable for a while.");
+        }
+
+        if (!statusLabelForDisplay.empty()) {
+            dl->AddText(ImVec2(p0.x + 10.0f * uiScale, p0.y + 88.0f * uiScale), muted, statusLabelForDisplay.c_str());
+        }
+        return;
+    }
+
+    static bool s_expanded = true;
+    static bool s_searchDirty = false;
+    static bool s_searchDrawerOpen = false;
+    static int s_matchFilter = 0; // 0=ranked,1=all,2=private,3=casual,4=event
+    static std::string s_lastSyncedRequested;
+    static char s_searchBuf[64] = { 0 };
+    static std::vector<std::string> s_cachedSearchPlayers;
+    static std::vector<std::string> s_recentLoadedPlayers;
+    static bool s_recentLoadedPlayersLoaded = false;
+
+    auto trimAscii = [](std::string& value) {
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())) != 0) value.erase(value.begin());
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())) != 0) value.pop_back();
+    };
+    auto toLowerAscii = [](const std::string& in) {
+        std::string out = in;
+        std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return out;
+    };
+    auto containsIgnoreCase = [&](const std::string& haystack, const std::string& needle) {
+        if (needle.empty()) return true;
+        return toLowerAscii(haystack).find(toLowerAscii(needle)) != std::string::npos;
+    };
+    auto equalsIgnoreCase = [&](const std::string& a, const std::string& b) {
+        return toLowerAscii(a) == toLowerAscii(b);
+    };
+    auto recentPlayersFilePath = [&]() -> std::filesystem::path {
+        if (!g_toolscreenPath.empty()) {
+            return std::filesystem::path(g_toolscreenPath) / L"mcsr_recent_players.txt";
+        }
+        return std::filesystem::path(L"mcsr_recent_players.txt");
+    };
+    auto persistRecentLoadedPlayers = [&]() {
+        std::error_code ec;
+        const std::filesystem::path path = recentPlayersFilePath();
+        if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path(), ec); }
+        std::ofstream out(path, std::ios::trunc);
+        if (!out.is_open()) return;
+        for (const std::string& name : s_recentLoadedPlayers) {
+            if (name.empty()) continue;
+            out << name << "\n";
+        }
+    };
+    auto loadRecentLoadedPlayersIfNeeded = [&]() {
+        if (s_recentLoadedPlayersLoaded) return;
+        s_recentLoadedPlayersLoaded = true;
+        s_recentLoadedPlayers.clear();
+
+        std::ifstream in(recentPlayersFilePath());
+        if (!in.is_open()) return;
+
+        std::string line;
+        while (std::getline(in, line)) {
+            trimAscii(line);
+            if (line.empty()) continue;
+            bool exists = false;
+            for (const std::string& existing : s_recentLoadedPlayers) {
+                if (equalsIgnoreCase(existing, line)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (exists) continue;
+            s_recentLoadedPlayers.push_back(line);
+            if (s_recentLoadedPlayers.size() >= 5) break;
+        }
+    };
+    auto pushUniqueCachedPlayer = [&](const std::string& candidate) {
+        std::string value = candidate;
+        trimAscii(value);
+        if (value.empty()) return;
+        for (const std::string& existing : s_cachedSearchPlayers) {
+            if (equalsIgnoreCase(existing, value)) return;
+        }
+        s_cachedSearchPlayers.push_back(value);
+        if (s_cachedSearchPlayers.size() > 4096) { s_cachedSearchPlayers.erase(s_cachedSearchPlayers.begin()); }
+    };
+    auto pushRecentLoadedPlayer = [&](const std::string& candidate) {
+        loadRecentLoadedPlayersIfNeeded();
+        std::string value = candidate;
+        trimAscii(value);
+        if (value.empty()) return;
+        auto it = std::remove_if(s_recentLoadedPlayers.begin(), s_recentLoadedPlayers.end(),
+                                 [&](const std::string& existing) { return equalsIgnoreCase(existing, value); });
+        if (it != s_recentLoadedPlayers.end()) s_recentLoadedPlayers.erase(it, s_recentLoadedPlayers.end());
+        s_recentLoadedPlayers.insert(s_recentLoadedPlayers.begin(), value);
+        if (s_recentLoadedPlayers.size() > 5) s_recentLoadedPlayers.resize(5);
+        persistRecentLoadedPlayers();
+    };
+
+    auto formatDurationMs = [](int durationMs) -> std::string {
+        if (durationMs <= 0) return "--:--.--";
+        const int totalSeconds = durationMs / 1000;
+        const int minutes = totalSeconds / 60;
+        const int seconds = totalSeconds % 60;
+        const int centiseconds = (durationMs % 1000) / 10;
+        std::ostringstream out;
+        out << std::setfill('0') << std::setw(2) << minutes << ":" << std::setw(2) << seconds << "." << std::setw(2) << centiseconds;
+        return out.str();
+    };
+
+    auto formatPercentShort = [](float value) -> std::string {
+        const float clamped = std::clamp(value, 0.0f, 100.0f);
+        std::ostringstream out;
+        if (std::fabs(clamped - std::round(clamped)) < 0.05f) {
+            out << static_cast<int>(std::round(clamped)) << "%";
+        } else {
+            out << std::fixed << std::setprecision(1) << clamped << "%";
+        }
+        return out.str();
+    };
+
+    auto tierLabelForElo = [](int elo) -> const char* {
+        if (elo >= 1800) return "Netherite";
+        if (elo >= 1500) return "Diamond";
+        if (elo >= 1200) return "Gold";
+        if (elo >= 900) return "Silver";
+        if (elo >= 600) return "Iron";
+        return "Coal";
+    };
+
+    const ImVec2 expandedSize(std::clamp(display.x * 0.76f, 1080.0f * uiScale, 1640.0f * uiScale),
+                              std::clamp(display.y * 0.72f, 620.0f * uiScale, 920.0f * uiScale));
+    const ImVec2 compactSize(std::clamp(display.x * 0.56f, 780.0f * uiScale, 1160.0f * uiScale),
+                             std::clamp(display.y * 0.52f, 430.0f * uiScale, 660.0f * uiScale));
+
+    const ImVec2 chosenSize = s_expanded ? expandedSize : compactSize;
+    const ImVec2 defaultPos(std::clamp(display.x - chosenSize.x - (30.0f * uiScale) + static_cast<float>(snap.x), 0.0f,
+                                       std::max(0.0f, display.x - 280.0f * uiScale)),
+                            std::clamp((34.0f * uiScale) + static_cast<float>(snap.y), 0.0f, std::max(0.0f, display.y - 220.0f * uiScale)));
+
+    ImGui::SetNextWindowPos(defaultPos, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(chosenSize, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(1.0f);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f * uiScale, 12.0f * uiScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f * uiScale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * uiScale);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(10, 16, 28, 255));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(68, 86, 120, static_cast<int>(220.0f * overlayOpacity)));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(16, 22, 35, 255));
+    ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(30, 48, 78, 180));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(40, 62, 98, 220));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(48, 72, 110, 240));
+
+    const ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    if (ImGui::Begin("MCSR Ranked Tracker###MCSR_TRACKER_OVERLAY", nullptr, windowFlags)) {
+        const float pad = 8.0f * uiScale;
+        const ImU32 titleColor = IM_COL32(224, 236, 255, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 bodyColor = IM_COL32(196, 208, 232, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 mutedColor = IM_COL32(130, 146, 176, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 winColor = IM_COL32(82, 235, 140, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 lossColor = IM_COL32(255, 104, 116, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 drawColor = IM_COL32(98, 170, 255, static_cast<int>(255.0f * overlayOpacity));
+        const ImU32 warnColor = IM_COL32(255, 170, 170, static_cast<int>(255.0f * overlayOpacity));
+
+        const std::string playerLabel = !snap.headerLabel.empty() ? snap.headerLabel :
+                                        (!snap.displayPlayer.empty() ? snap.displayPlayer :
+                                         (!snap.requestedPlayer.empty() ? snap.requestedPlayer : "MCSR Player"));
+        pushUniqueCachedPlayer("Feinberg");
+        pushUniqueCachedPlayer(snap.autoDetectedPlayer);
+        pushUniqueCachedPlayer(snap.requestedPlayer);
+        pushUniqueCachedPlayer(snap.displayPlayer);
+        for (const std::string& suggested : snap.suggestedPlayers) {
+            pushUniqueCachedPlayer(suggested);
+        }
+        loadRecentLoadedPlayersIfNeeded();
+        auto tierColorForElo = [&](int elo) {
+            if (elo >= 1800) return IM_COL32(194, 242, 255, static_cast<int>(255.0f * overlayOpacity));
+            if (elo >= 1500) return IM_COL32(120, 206, 255, static_cast<int>(255.0f * overlayOpacity));
+            if (elo >= 1200) return IM_COL32(255, 221, 130, static_cast<int>(255.0f * overlayOpacity));
+            if (elo >= 900) return IM_COL32(193, 208, 234, static_cast<int>(255.0f * overlayOpacity));
+            if (elo >= 600) return IM_COL32(185, 197, 216, static_cast<int>(255.0f * overlayOpacity));
+            return IM_COL32(152, 164, 184, static_cast<int>(255.0f * overlayOpacity));
+        };
+        const std::string homePlayer = snap.autoDetectedPlayer;
+        const std::string viewingPlayer = !snap.displayPlayer.empty() ? snap.displayPlayer : playerLabel;
+        const bool hasHome = !homePlayer.empty();
+        const bool viewingOther = hasHome && !equalsIgnoreCase(viewingPlayer, homePlayer);
+
+        auto makeInitials = [&](const std::string& name) {
+            std::string initials;
+            for (char ch : name) {
+                if (std::isalnum(static_cast<unsigned char>(ch)) == 0) continue;
+                initials.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+                if (initials.size() >= 2) break;
+            }
+            if (initials.empty()) initials = "P";
+            return initials;
+        };
+
+        auto applyPlayerSelection = [&](const std::string& valueRaw) {
+            std::string value = valueRaw;
+            trimAscii(value);
+            if (value.empty()) return;
+            SetMcsrApiTrackerSearchPlayer(value);
+            pushRecentLoadedPlayer(value);
+            s_searchBuf[0] = '\0';
+            s_lastSyncedRequested = value;
+            s_searchDirty = false;
+        };
+
+        if (s_searchDrawerOpen) {
+            const float drawerWidth = std::clamp(290.0f * uiScale, 220.0f * uiScale, 360.0f * uiScale);
+            if (ImGui::BeginChild("##McsrSearchDrawer", ImVec2(drawerWidth, 0.0f), true,
+                                  ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                ImGui::TextColored(ImColor(titleColor), "Player Search");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X##McsrCloseDrawer")) { s_searchDrawerOpen = false; }
+                if (hasHome) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("My Profile##McsrDrawerHome")) { applyPlayerSelection(homePlayer); }
+                }
+                ImGui::Separator();
+
+                const float slashButtonW = 22.0f * uiScale;
+                ImGui::SetNextItemWidth(std::max(120.0f * uiScale, ImGui::GetContentRegionAvail().x - slashButtonW - (6.0f * uiScale)));
+                const bool searchEdited =
+                    ImGui::InputTextWithHint("##McsrOverlaySearch", "Search for players", s_searchBuf, static_cast<int>(sizeof(s_searchBuf)),
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+                if (ImGui::IsItemActivated()) {
+                    s_searchBuf[0] = '\0';
+                    s_searchDirty = true;
+                }
+                if (searchEdited) { applyPlayerSelection(s_searchBuf); }
+                else if (ImGui::IsItemEdited()) {
+                    s_searchDirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("/##McsrDrawerSearch")) { applyPlayerSelection(s_searchBuf); }
+
+                std::vector<std::string> filteredSuggestions;
+                std::vector<std::string> filteredRecent;
+                {
+                    std::string query = s_searchBuf;
+                    trimAscii(query);
+                    for (const std::string& candidate : s_cachedSearchPlayers) {
+                        if (candidate.empty()) continue;
+                        if (!containsIgnoreCase(candidate, query)) continue;
+                        filteredSuggestions.push_back(candidate);
+                        if (filteredSuggestions.size() >= 24) break;
+                    }
+                    for (const std::string& candidate : s_recentLoadedPlayers) {
+                        if (candidate.empty()) continue;
+                        if (!containsIgnoreCase(candidate, query)) continue;
+                        bool alreadyInRanked = false;
+                        for (const std::string& rankedCandidate : filteredSuggestions) {
+                            if (equalsIgnoreCase(rankedCandidate, candidate)) {
+                                alreadyInRanked = true;
+                                break;
+                            }
+                        }
+                        if (alreadyInRanked) continue;
+                        filteredRecent.push_back(candidate);
+                        if (filteredRecent.size() >= 5) break;
+                    }
+                }
+
+                ImGui::Spacing();
+                if (ImGui::BeginChild("##McsrDrawerSuggestions", ImVec2(0.0f, 0.0f), false,
+                                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                    ImGui::TextDisabled("Ranked players");
+                    ImGui::Separator();
+                    for (size_t i = 0; i < filteredSuggestions.size(); ++i) {
+                        const std::string& suggestion = filteredSuggestions[i];
+                        const bool selected = equalsIgnoreCase(suggestion, viewingPlayer);
+                        if (selected) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(238, 204, 130, static_cast<int>(255.0f * overlayOpacity)));
+                        std::string label = std::to_string(static_cast<int>(i + 1)) + ". " + suggestion + "##McsrRankedSugg" +
+                                            std::to_string(i);
+                        if (ImGui::Selectable(label.c_str(), selected)) { applyPlayerSelection(suggestion); }
+                        if (selected) ImGui::PopStyleColor();
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Recent quicksearch");
+                    ImGui::Separator();
+                    if (filteredRecent.empty()) {
+                        ImGui::TextDisabled("No recent profiles yet");
+                    } else {
+                        for (size_t i = 0; i < filteredRecent.size(); ++i) {
+                            const std::string& suggestion = filteredRecent[i];
+                            const bool selected = equalsIgnoreCase(suggestion, viewingPlayer);
+                            if (selected) {
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                      IM_COL32(238, 204, 130, static_cast<int>(255.0f * overlayOpacity)));
+                            }
+                            std::string label =
+                                "R" + std::to_string(static_cast<int>(i + 1)) + ". " + suggestion + "##McsrRecentSugg" +
+                                std::to_string(i);
+                            if (ImGui::Selectable(label.c_str(), selected)) { applyPlayerSelection(suggestion); }
+                            if (selected) ImGui::PopStyleColor();
+                        }
+                    }
+                }
+                ImGui::EndChild();
+            }
+            ImGui::EndChild();
+            ImGui::SameLine(0.0f, pad);
+        }
+
+        if (ImGui::BeginChild("##McsrMainContent", ImVec2(0.0f, 0.0f), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+            ImGui::Spacing();
+            const float topPanelHeight = s_expanded ? (236.0f * uiScale) : (176.0f * uiScale);
+            if (ImGui::BeginChild("##McsrTopPanel", ImVec2(0.0f, topPanelHeight), true,
+                                  ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                const int seasonGames = std::max(0, snap.seasonWins + snap.seasonLosses);
+                const float seasonWinrate =
+                    (seasonGames > 0) ? (100.0f * static_cast<float>(snap.seasonWins) / static_cast<float>(seasonGames)) : 0.0f;
+                const bool hasAvatarTexture = RT_EnsureMcsrTextureFromFile(snap.avatarImagePath, g_mcsrAvatarTextureCache);
+                const bool hasFlagTexture = RT_EnsureMcsrTextureFromFile(snap.flagImagePath, g_mcsrFlagTextureCache);
+
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImU32 dividerColor = IM_COL32(80, 102, 140, static_cast<int>(220.0f * overlayOpacity));
+                const ImU32 valueColor = IM_COL32(236, 245, 255, static_cast<int>(255.0f * overlayOpacity));
+                const float menuBtnSize = 24.0f * uiScale;
+                const ImVec2 menuPos = ImGui::GetCursorScreenPos();
+                const ImVec2 menuEnd(menuPos.x + menuBtnSize, menuPos.y + menuBtnSize);
+                ImGui::InvisibleButton("##McsrDrawerToggle", ImVec2(menuBtnSize, menuBtnSize));
+                const bool menuClicked = ImGui::IsItemClicked();
+                const bool menuHovered = ImGui::IsItemHovered();
+                const ImU32 menuBg = s_searchDrawerOpen ? IM_COL32(54, 78, 112, 255)
+                                                        : (menuHovered ? IM_COL32(44, 62, 92, 255) : IM_COL32(30, 44, 66, 255));
+                const ImU32 menuBorder = IM_COL32(104, 136, 184, 255);
+                const ImU32 menuLine = IM_COL32(220, 232, 252, 255);
+                dl->AddRectFilled(menuPos, menuEnd, menuBg, 5.0f * uiScale);
+                dl->AddRect(menuPos, menuEnd, menuBorder, 5.0f * uiScale, 0, std::max(1.0f, 1.1f * uiScale));
+                const float lx0 = menuPos.x + (6.0f * uiScale);
+                const float lx1 = menuEnd.x - (6.0f * uiScale);
+                const float ly0 = menuPos.y + (7.0f * uiScale);
+                const float ldy = 5.0f * uiScale;
+                dl->AddLine(ImVec2(lx0, ly0), ImVec2(lx1, ly0), menuLine, std::max(1.0f, 1.6f * uiScale));
+                dl->AddLine(ImVec2(lx0, ly0 + ldy), ImVec2(lx1, ly0 + ldy), menuLine, std::max(1.0f, 1.6f * uiScale));
+                dl->AddLine(ImVec2(lx0, ly0 + (2.0f * ldy)), ImVec2(lx1, ly0 + (2.0f * ldy)), menuLine,
+                            std::max(1.0f, 1.6f * uiScale));
+                if (menuClicked) { s_searchDrawerOpen = !s_searchDrawerOpen; }
+
+                const int safeElo = std::max(0, snap.eloRate);
+                const int safePeak = std::max(0, snap.peakElo);
+                const int safePoints = std::max(0, snap.seasonPoints);
+
+                ImGui::SameLine();
+                if (ImGui::Button("Refresh##McsrTopRefresh")) { RequestMcsrApiTrackerRefresh(); }
+                ImGui::SameLine();
+                if (ImGui::Button(s_expanded ? "Compact##McsrTopCompact" : "Expand##McsrTopCompact")) {
+                    s_expanded = !s_expanded;
+                    ImGui::SetWindowSize(s_expanded ? expandedSize : compactSize, ImGuiCond_Always);
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", snap.refreshOnlyMode ? "Refresh-only mode" : "Auto polling mode");
+
+                const float profileForfeitRatePercent = std::clamp(
+                    (snap.profileForfeitRatePercent > 0.0f || snap.recentForfeitRatePercent <= 0.0f) ? snap.profileForfeitRatePercent
+                                                                                                       : snap.recentForfeitRatePercent,
+                    0.0f, 100.0f);
+                const int displayAverageMs = (snap.profileAverageTimeMs > 0) ? snap.profileAverageTimeMs : snap.averageResultTimeMs;
+
+                auto drawSegmentLine = [&](float x, float y, float fontSize,
+                                           const std::vector<std::pair<std::string, ImU32>>& segments) {
+                    const ImU32 shadow = IM_COL32(8, 12, 18, static_cast<int>(220.0f * overlayOpacity));
+                    float cursorX = x;
+                    for (const auto& seg : segments) {
+                        if (seg.first.empty()) continue;
+                        dl->AddText(ImGui::GetFont(), fontSize, ImVec2(cursorX + (1.0f * uiScale), y + (1.0f * uiScale)), shadow,
+                                    seg.first.c_str());
+                        dl->AddText(ImGui::GetFont(), fontSize, ImVec2(cursorX, y), seg.second, seg.first.c_str());
+                        cursorX += ImGui::GetFont()->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, seg.first.c_str()).x;
+                    }
+                };
+
+                auto drawGradientText = [&](const ImVec2& pos, float fontSize, const std::string& text, ImU32 leftCol, ImU32 rightCol) {
+                    if (text.empty()) return;
+                    float totalWidth = 0.0f;
+                    std::vector<float> widths;
+                    widths.reserve(text.size());
+                    for (char c : text) {
+                        char buf[2] = { c, '\0' };
+                        const float w = ImGui::GetFont()->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, buf).x;
+                        widths.push_back(w);
+                        totalWidth += w;
+                    }
+                    float cursorX = pos.x;
+                    for (size_t i = 0; i < text.size(); ++i) {
+                        char buf[2] = { text[i], '\0' };
+                        const float centerX = cursorX + (widths[i] * 0.5f);
+                        const float t = (totalWidth > 0.0f) ? std::clamp((centerX - pos.x) / totalWidth, 0.0f, 1.0f) : 0.0f;
+                        dl->AddText(ImGui::GetFont(), fontSize, ImVec2(cursorX, pos.y), RT_LerpColor(leftCol, rightCol, t), buf);
+                        cursorX += widths[i];
+                    }
+                };
+
+                ImGui::Dummy(ImVec2(0.0f, 5.0f * uiScale));
+                const ImVec2 contentPos = ImGui::GetCursorScreenPos();
+                const float contentW = std::max(80.0f * uiScale, ImGui::GetContentRegionAvail().x);
+                const float avatarSize = s_expanded ? (128.0f * uiScale) : (100.0f * uiScale);
+                float nameFontSize = s_expanded ? (34.0f * uiScale) : (27.0f * uiScale);
+                const float leftPad = 2.0f * uiScale;
+                float nameWidth = ImGui::GetFont()->CalcTextSizeA(nameFontSize, FLT_MAX, 0.0f, viewingPlayer.c_str()).x;
+                const float leftBlockMaxW = contentW * (s_expanded ? 0.34f : 0.36f);
+                float leftBlockW =
+                    std::clamp(std::max(avatarSize + (8.0f * uiScale), nameWidth + (12.0f * uiScale)), 126.0f * uiScale, leftBlockMaxW);
+                const float maxNameW = std::max(30.0f * uiScale, leftBlockW - (8.0f * uiScale));
+                while (nameFontSize > (16.0f * uiScale) && nameWidth > maxNameW) {
+                    nameFontSize -= (1.0f * uiScale);
+                    nameWidth = ImGui::GetFont()->CalcTextSizeA(nameFontSize, FLT_MAX, 0.0f, viewingPlayer.c_str()).x;
+                }
+                const float avatarX = contentPos.x + leftPad + ((leftBlockW - avatarSize) * 0.5f);
+                const float avatarY = contentPos.y + (2.0f * uiScale);
+                const ImVec2 avatarMin(avatarX, avatarY);
+                const ImVec2 avatarMax(avatarX + avatarSize, avatarY + avatarSize);
+                const std::string initials = makeInitials(viewingPlayer);
+                const ImU32 avatarFallbackBg = viewingOther ? IM_COL32(78, 62, 36, 230) : IM_COL32(40, 58, 86, 230);
+                const ImU32 avatarFallbackText = IM_COL32(228, 238, 255, 255);
+
+                if (hasAvatarTexture && g_mcsrAvatarTextureCache.textureId != 0) {
+                    ImVec2 uv0 = g_mcsrAvatarTextureCache.uvMin;
+                    ImVec2 uv1 = g_mcsrAvatarTextureCache.uvMax;
+                    std::swap(uv0.y, uv1.y); // Crafatar head assets are vertically flipped in this draw path.
+                    dl->AddImage((ImTextureID)(intptr_t)g_mcsrAvatarTextureCache.textureId, avatarMin, avatarMax, uv0, uv1);
+                } else {
+                    dl->AddRectFilled(avatarMin, avatarMax, avatarFallbackBg, 4.0f * uiScale);
+                    const float fallbackFont = std::max(16.0f, 34.0f * uiScale);
+                    const ImVec2 initSize = ImGui::GetFont()->CalcTextSizeA(fallbackFont, FLT_MAX, 0.0f, initials.c_str());
+                    dl->AddText(ImGui::GetFont(), fallbackFont,
+                                ImVec2(avatarX + ((avatarSize - initSize.x) * 0.5f), avatarY + ((avatarSize - initSize.y) * 0.5f)),
+                                avatarFallbackText, initials.c_str());
+                }
+
+                const float nameY = avatarY + avatarSize + (8.0f * uiScale);
+                const float nameX = contentPos.x + leftPad + ((leftBlockW - nameWidth) * 0.5f);
+                const ImU32 gradA = viewingOther ? IM_COL32(255, 188, 118, static_cast<int>(255.0f * overlayOpacity))
+                                                 : IM_COL32(117, 234, 255, static_cast<int>(255.0f * overlayOpacity));
+                const ImU32 gradB = viewingOther ? IM_COL32(255, 120, 164, static_cast<int>(255.0f * overlayOpacity))
+                                                 : IM_COL32(151, 255, 155, static_cast<int>(255.0f * overlayOpacity));
+                drawGradientText(ImVec2(nameX, nameY), nameFontSize, viewingPlayer, gradA, gradB);
+
+                const float statsX = contentPos.x + leftPad + leftBlockW + (10.0f * uiScale);
+                const float statsW = std::max(150.0f * uiScale, contentW - (leftBlockW + (14.0f * uiScale)));
+                float statFontSize = s_expanded ? (24.0f * uiScale) : (19.5f * uiScale);
+                if (statsW < (640.0f * uiScale)) {
+                    statFontSize *= std::clamp(statsW / (640.0f * uiScale), 0.80f, 1.0f);
+                }
+                const float statLineStep = statFontSize * 1.33f;
+                const float statsY = contentPos.y + (8.0f * uiScale);
+                const float midX = statsX + (statsW * 0.50f);
+                const float statsBottom = statsY + (statLineStep * 3.02f);
+                dl->AddRectFilled(ImVec2(statsX + (2.0f * uiScale), statsY - (5.0f * uiScale)),
+                                  ImVec2(midX - (8.0f * uiScale), statsBottom + (7.0f * uiScale)),
+                                  IM_COL32(16, 26, 42, static_cast<int>(128.0f * overlayOpacity)), 5.0f * uiScale);
+                dl->AddRectFilled(ImVec2(midX + (6.0f * uiScale), statsY - (5.0f * uiScale)),
+                                  ImVec2(statsX + statsW - (2.0f * uiScale), statsBottom + (7.0f * uiScale)),
+                                  IM_COL32(16, 26, 42, static_cast<int>(128.0f * overlayOpacity)), 5.0f * uiScale);
+                dl->AddLine(ImVec2(midX, statsY - (2.0f * uiScale)), ImVec2(midX, statsBottom + (4.0f * uiScale)), dividerColor,
+                            std::max(1.0f, 1.5f * uiScale));
+
+                const float col1X = statsX + (6.0f * uiScale);
+                const float col2X = midX + (12.0f * uiScale);
+                const float y1 = statsY;
+                const float y2 = statsY + statLineStep;
+                const float y3 = statsY + (2.0f * statLineStep);
+                const ImU32 wrColor = RT_LerpColor(lossColor, winColor, std::clamp(seasonWinrate / 100.0f, 0.0f, 1.0f));
+                const ImU32 ffColor = RT_LerpColor(winColor, lossColor, std::clamp(profileForfeitRatePercent / 100.0f, 0.0f, 1.0f));
+                const ImU32 timeColor = IM_COL32(255, 216, 150, static_cast<int>(255.0f * overlayOpacity));
+                const ImU32 accentColor = IM_COL32(146, 212, 255, static_cast<int>(255.0f * overlayOpacity));
+
+                float line1StartX = col1X;
+                if (hasFlagTexture && g_mcsrFlagTextureCache.textureId != 0) {
+                    const float flagW = 24.0f * uiScale;
+                    const float flagH = 16.0f * uiScale;
+                    const ImVec2 flagPos(col1X, y1 + (4.0f * uiScale));
+                    const ImVec2 flagEnd(flagPos.x + flagW, flagPos.y + flagH);
+                    dl->AddImage((ImTextureID)(intptr_t)g_mcsrFlagTextureCache.textureId, flagPos, flagEnd, g_mcsrFlagTextureCache.uvMin,
+                                 g_mcsrFlagTextureCache.uvMax);
+                    dl->AddRect(flagPos, flagEnd, IM_COL32(98, 122, 168, static_cast<int>(240.0f * overlayOpacity)), 2.0f * uiScale, 0,
+                                std::max(1.0f, 1.0f * uiScale));
+                    line1StartX += flagW + (9.0f * uiScale);
+                }
+
+                drawSegmentLine(line1StartX, y1, statFontSize,
+                                { { "#", mutedColor }, { std::to_string(std::max(0, snap.eloRank)), valueColor }, { " | ", mutedColor },
+                                  { tierLabelForElo(safeElo), tierColorForElo(safeElo) } });
+                drawSegmentLine(col1X, y2, statFontSize,
+                                { { "ELO ", mutedColor }, { std::to_string(safeElo), accentColor }, { " | PEAK ", mutedColor },
+                                  { std::to_string(safePeak), accentColor } });
+                drawSegmentLine(col1X, y3, statFontSize,
+                                { { "W ", mutedColor }, { std::to_string(std::max(0, snap.seasonWins)), winColor }, { " | L ", mutedColor },
+                                  { std::to_string(std::max(0, snap.seasonLosses)), lossColor }, { " | C ", mutedColor },
+                                  { std::to_string(std::max(0, snap.seasonCompletions)), drawColor } });
+
+                drawSegmentLine(col2X, y1, statFontSize,
+                                { { "WR ", mutedColor }, { formatPercentShort(seasonWinrate), wrColor }, { " | PB ", mutedColor },
+                                  { formatDurationMs(snap.bestTimeMs), timeColor } });
+                drawSegmentLine(col2X, y2, statFontSize,
+                                { { "AVG ", mutedColor }, { formatDurationMs(displayAverageMs), timeColor }, { " | FF ", mutedColor },
+                                  { formatPercentShort(profileForfeitRatePercent), ffColor } });
+                drawSegmentLine(col2X, y3, statFontSize,
+                                { { "WS ", mutedColor }, { std::to_string(std::max(0, snap.seasonBestWinStreak)), valueColor },
+                                  { " | PTS ", mutedColor }, { std::to_string(safePoints), drawColor } });
+
+                if (!statusLabelForDisplay.empty()) {
+                    dl->AddText(ImGui::GetFont(), std::max(14.0f, 15.0f * uiScale),
+                                ImVec2(statsX, statsBottom + (8.0f * uiScale)), warnColor, statusLabelForDisplay.c_str());
+                }
+                ImGui::Dummy(ImVec2(0.0f, topPanelHeight * 0.72f));
+            }
+            ImGui::EndChild();
+
+            if (!snap.apiOnline) {
+                if (!snap.autoDetectedPlayer.empty()) { ImGui::TextDisabled("Auto: %s", snap.autoDetectedPlayer.c_str()); }
+                ImGui::EndChild();
+                ImGui::End();
+                ImGui::PopStyleColor(6);
+                ImGui::PopStyleVar(3);
+                return;
+            }
+
+        std::vector<float> eloSeries;
+        eloSeries.reserve(std::max<size_t>(1, snap.eloHistory.size()));
+        int minElo = std::max(1, snap.eloRate);
+        int maxElo = std::max(minElo + 1, snap.eloRate + 1);
+        for (int v : snap.eloHistory) {
+            eloSeries.push_back(static_cast<float>(v));
+            minElo = std::min(minElo, v);
+            maxElo = std::max(maxElo, v);
+        }
+        if (eloSeries.empty()) eloSeries.push_back(static_cast<float>(std::max(0, snap.eloRate)));
+        int eloRange = std::max(1, maxElo - minElo);
+        const int minVisualRange = 80;
+        if (eloRange < minVisualRange) {
+            const int mid = (minElo + maxElo) / 2;
+            minElo = mid - (minVisualRange / 2);
+            maxElo = mid + (minVisualRange / 2);
+        }
+        eloRange = std::max(1, maxElo - minElo);
+        const int graphMargin = std::max(12, eloRange / 12);
+        minElo -= graphMargin;
+        maxElo += graphMargin;
+        minElo = std::max(0, minElo);
+
+        if (s_expanded) {
+            const float leftW = std::max(360.0f * uiScale, ImGui::GetContentRegionAvail().x * 0.34f);
+            if (ImGui::BeginChild("##McsrMatches", ImVec2(leftW, 0.0f), true)) {
+                static const char* kMatchFilterLabels[] = { "Ranked", "All", "Private", "Casual", "Event" };
+                auto rowMatchesFilter = [&](const McsrApiTrackerRenderSnapshot::MatchRow& row) {
+                    switch (s_matchFilter) {
+                    case 0: // ranked
+                        return row.categoryType == 0;
+                    case 1: // all
+                        return true;
+                    case 2: // private
+                        return row.categoryType == 1;
+                    case 3: // casual
+                        return row.categoryType == 2;
+                    case 4: // event
+                        return row.categoryType == 3;
+                    default:
+                        return row.categoryType == 0;
+                    }
+                };
+                size_t filteredCount = 0;
+                for (const auto& row : snap.recentMatches) {
+                    if (rowMatchesFilter(row)) ++filteredCount;
+                }
+
+                ImGui::TextColored(ImColor(titleColor), "MATCHES");
+                ImGui::SameLine();
+                ImGui::TextColored(ImColor(mutedColor), "%zu shown", filteredCount);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(112.0f * uiScale);
+                if (ImGui::BeginCombo("##McsrMatchFilter", kMatchFilterLabels[std::clamp(s_matchFilter, 0, 4)])) {
+                    for (int idx = 0; idx < 5; ++idx) {
+                        const bool selected = (s_matchFilter == idx);
+                        if (ImGui::Selectable(kMatchFilterLabels[idx], selected)) { s_matchFilter = idx; }
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::Separator();
+
+                if (ImGui::BeginTable("##McsrMatchesTable", 4,
+                                      ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV |
+                                          ImGuiTableFlags_ScrollY,
+                                      ImVec2(0.0f, 0.0f))) {
+                    ImGui::TableSetupColumn("Opponent", ImGuiTableColumnFlags_WidthStretch, 0.50f);
+                    ImGui::TableSetupColumn("Result", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+                    ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch, 0.20f);
+                    ImGui::TableSetupColumn("Age", ImGuiTableColumnFlags_WidthStretch, 0.12f);
+                    ImGui::TableHeadersRow();
+                    for (size_t i = 0; i < snap.recentMatches.size(); ++i) {
+                        const auto& row = snap.recentMatches[i];
+                        if (!rowMatchesFilter(row)) continue;
+                        const ImU32 resultClr = (row.resultType > 0) ? winColor : ((row.resultType < 0) ? lossColor : drawColor);
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        const bool canLoadOpponent = !row.opponent.empty() && !equalsIgnoreCase(row.opponent, "Unknown");
+                        if (canLoadOpponent) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, drawColor);
+                            ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(28, 45, 72, 140));
+                            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(36, 58, 92, 190));
+                            ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(46, 72, 110, 210));
+                            const std::string oppLabel = row.opponent + "##McsrMatchOpp" + std::to_string(i);
+                            if (ImGui::Selectable(oppLabel.c_str(), false)) {
+                                applyPlayerSelection(row.opponent);
+                            }
+                            if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Load profile"); }
+                            ImGui::PopStyleColor(4);
+                        } else {
+                            ImGui::TextColored(ImColor(bodyColor), "%s", row.opponent.c_str());
+                        }
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextColored(ImColor(resultClr), "%s", row.resultLabel.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextColored(ImColor(mutedColor), "%s", row.forfeited ? "FORFEIT" : row.detailLabel.c_str());
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextColored(ImColor(mutedColor), "%s", row.ageLabel.c_str());
+                    }
+                    ImGui::EndTable();
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::SameLine(0.0f, pad);
+            if (ImGui::BeginChild("##McsrGraph", ImVec2(0.0f, 0.0f), true,
+                                  ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+                ImGui::TextColored(ImColor(titleColor), "ELO TREND");
+                ImGui::SameLine();
+                ImGui::TextColored(ImColor(mutedColor), "%d points", static_cast<int>(eloSeries.size()));
+                ImGui::Separator();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 graphOrigin = ImGui::GetCursorScreenPos();
+                const ImVec2 graphAvail = ImGui::GetContentRegionAvail();
+                const float graphBottomReserve = 46.0f * uiScale;
+                const std::string axisMaxLabel = std::to_string(maxElo);
+                const std::string axisMinLabel = std::to_string(minElo);
+                const float axisLabelW = std::max(ImGui::CalcTextSize(axisMaxLabel.c_str()).x, ImGui::CalcTextSize(axisMinLabel.c_str()).x);
+                const float leftAxisPad = axisLabelW + (18.0f * uiScale);
+                const ImVec2 plotMin(graphOrigin.x + leftAxisPad, graphOrigin.y + 8.0f * uiScale);
+                const ImVec2 plotMax(graphOrigin.x + graphAvail.x - 14.0f * uiScale, graphOrigin.y + graphAvail.y - graphBottomReserve);
+                const float plotW = std::max(1.0f, plotMax.x - plotMin.x);
+                const float plotH = std::max(1.0f, plotMax.y - plotMin.y);
+                dl->AddRectFilled(plotMin, plotMax, IM_COL32(13, 20, 32, 255), 4.0f * uiScale);
+                dl->AddRect(plotMin, plotMax, IM_COL32(62, 84, 123, static_cast<int>(220.0f * overlayOpacity)), 4.0f * uiScale);
+
+                const int yTicks = 5;
+                for (int i = 0; i < yTicks; ++i) {
+                    const float t = static_cast<float>(i) / static_cast<float>(yTicks - 1);
+                    const float y = plotMin.y + t * plotH;
+                    const int labelValue = static_cast<int>(std::round(static_cast<float>(maxElo) - t * static_cast<float>(maxElo - minElo)));
+                    dl->AddLine(ImVec2(plotMin.x, y), ImVec2(plotMax.x, y),
+                                IM_COL32(60, 80, 110, static_cast<int>(110.0f * overlayOpacity)), 1.0f);
+                    const std::string lbl = std::to_string(labelValue);
+                    const ImVec2 lblSize = ImGui::CalcTextSize(lbl.c_str());
+                    float lblY = y - (lblSize.y * 0.5f);
+                    lblY = std::clamp(lblY, plotMin.y, plotMax.y - lblSize.y);
+                    dl->AddText(ImVec2(graphOrigin.x + 4.0f * uiScale, lblY),
+                                IM_COL32(156, 172, 204, static_cast<int>(255.0f * overlayOpacity)), lbl.c_str());
+                }
+
+                const int count = static_cast<int>(eloSeries.size());
+                const int xTicks = std::max(2, std::min(7, count));
+                for (int i = 0; i < xTicks; ++i) {
+                    const float t = static_cast<float>(i) / static_cast<float>(xTicks - 1);
+                    const float x = plotMin.x + t * plotW;
+                    dl->AddLine(ImVec2(x, plotMin.y), ImVec2(x, plotMax.y),
+                                IM_COL32(48, 66, 94, static_cast<int>(70.0f * overlayOpacity)), 1.0f);
+                }
+
+                if (snap.peakElo > 0) {
+                    const float peakNorm =
+                        (static_cast<float>(snap.peakElo) - static_cast<float>(minElo)) / static_cast<float>(std::max(1, maxElo - minElo));
+                    if (peakNorm >= -0.001f && peakNorm <= 1.001f) {
+                        const float peakY = plotMax.y - std::clamp(peakNorm, 0.0f, 1.0f) * plotH;
+                        const float dashLen = std::max(4.0f, 7.0f * uiScale);
+                        const float gapLen = std::max(3.0f, 5.0f * uiScale);
+                        const ImU32 peakLineColor = IM_COL32(236, 184, 96, static_cast<int>(220.0f * overlayOpacity));
+                        for (float sx = plotMin.x; sx < plotMax.x; sx += (dashLen + gapLen)) {
+                            const float ex = std::min(plotMax.x, sx + dashLen);
+                            dl->AddLine(ImVec2(sx, peakY), ImVec2(ex, peakY), peakLineColor, std::max(1.0f, 1.2f * uiScale));
+                        }
+                        const std::string peakLabel = "Peak " + std::to_string(std::max(0, snap.peakElo));
+                        const ImVec2 peakLabelSize = ImGui::CalcTextSize(peakLabel.c_str());
+                        const float peakLabelX = std::max(plotMin.x + 6.0f * uiScale, plotMax.x - peakLabelSize.x - (6.0f * uiScale));
+                        const float peakLabelY = std::clamp(peakY - peakLabelSize.y - (2.0f * uiScale), plotMin.y + 2.0f * uiScale,
+                                                            plotMax.y - peakLabelSize.y - (2.0f * uiScale));
+                        dl->AddText(ImVec2(peakLabelX, peakLabelY), peakLineColor, peakLabel.c_str());
+                    }
+                }
+
+                if (count >= 1) {
+                    std::vector<ImVec2> points;
+                    points.reserve(static_cast<size_t>(count));
+                    const float denom = static_cast<float>(std::max(1, count - 1));
+                    for (int i = 0; i < count; ++i) {
+                        const float tx = static_cast<float>(i) / denom;
+                        const float ty =
+                            (eloSeries[static_cast<size_t>(i)] - static_cast<float>(minElo)) / static_cast<float>(std::max(1, maxElo - minElo));
+                        points.emplace_back(plotMin.x + tx * plotW, plotMax.y - ty * plotH);
+                    }
+                    if (count >= 2) {
+                        dl->AddPolyline(points.data(), static_cast<int>(points.size()),
+                                        IM_COL32(201, 220, 255, static_cast<int>(250.0f * overlayOpacity)), 0,
+                                        std::max(1.4f, 2.0f * uiScale));
+                    }
+
+                    const ImVec2 mousePos = ImGui::GetIO().MousePos;
+                    const bool mouseInPlot =
+                        mousePos.x >= plotMin.x && mousePos.x <= plotMax.x && mousePos.y >= plotMin.y && mousePos.y <= plotMax.y;
+                    int hoveredPoint = -1;
+                    float hoveredDistSq = FLT_MAX;
+
+                    for (size_t i = 0; i < points.size(); ++i) {
+                        const float baseR = (i + 1 == points.size()) ? (3.4f * uiScale) : (2.2f * uiScale);
+                        const float hitR = std::max(baseR + (4.0f * uiScale), 8.0f * uiScale);
+                        if (mouseInPlot) {
+                            const float dx = mousePos.x - points[i].x;
+                            const float dy = mousePos.y - points[i].y;
+                            const float distSq = dx * dx + dy * dy;
+                            if (distSq <= hitR * hitR && distSq < hoveredDistSq) {
+                                hoveredDistSq = distSq;
+                                hoveredPoint = static_cast<int>(i);
+                            }
+                        }
+                    }
+
+                    for (size_t i = 0; i < points.size(); ++i) {
+                        const bool isHovered = (hoveredPoint == static_cast<int>(i));
+                        const float r =
+                            isHovered ? (4.4f * uiScale) : ((i + 1 == points.size()) ? (3.4f * uiScale) : (2.2f * uiScale));
+                        const ImU32 clr =
+                            isHovered ? IM_COL32(255, 230, 146, static_cast<int>(255.0f * overlayOpacity))
+                                      : ((i + 1 == points.size()) ? IM_COL32(114, 214, 255, static_cast<int>(255.0f * overlayOpacity))
+                                                                  : IM_COL32(166, 196, 255, static_cast<int>(220.0f * overlayOpacity)));
+                        dl->AddCircleFilled(points[i], r, clr);
+                    }
+
+                    if (hoveredPoint >= 0 && hoveredPoint < count) {
+                        ImGui::BeginTooltip();
+                        const int pointElo = static_cast<int>(std::lround(eloSeries[static_cast<size_t>(hoveredPoint)]));
+                        ImGui::Text("Match #%d (old -> new)", hoveredPoint + 1);
+                        ImGui::Text("ELO: %d", std::max(0, pointElo));
+                        if (static_cast<size_t>(hoveredPoint) < snap.eloTrendPoints.size()) {
+                            const auto& trend = snap.eloTrendPoints[static_cast<size_t>(hoveredPoint)];
+                            if (!trend.opponent.empty()) ImGui::Text("Opp: %s", trend.opponent.c_str());
+                            if (!trend.resultLabel.empty() || !trend.detailLabel.empty()) {
+                                ImGui::Text("%s  %s", trend.resultLabel.empty() ? "-" : trend.resultLabel.c_str(),
+                                            trend.detailLabel.empty() ? "-" : trend.detailLabel.c_str());
+                            }
+                            if (!trend.ageLabel.empty()) ImGui::Text("Age: %s", trend.ageLabel.c_str());
+                        }
+                        ImGui::EndTooltip();
+                    }
+                }
+
+                ImGui::Dummy(ImVec2(0.0f, std::max(10.0f, plotH + (6.0f * uiScale))));
+                const int oldestMatchesAgo = std::max(1, std::min(30, count));
+                const std::string leftMatchLabel = std::to_string(oldestMatchesAgo) + " matches ago";
+                const std::string rightMatchLabel = "last match";
+                const ImVec2 labelBase = ImGui::GetCursorScreenPos();
+                const ImVec2 rightSize = ImGui::CalcTextSize(rightMatchLabel.c_str());
+                dl->AddText(labelBase, IM_COL32(156, 172, 204, static_cast<int>(255.0f * overlayOpacity)), leftMatchLabel.c_str());
+                dl->AddText(ImVec2(plotMax.x - rightSize.x, labelBase.y), IM_COL32(156, 172, 204, static_cast<int>(255.0f * overlayOpacity)),
+                            rightMatchLabel.c_str());
+                ImGui::Dummy(ImVec2(0.0f, std::max(12.0f, rightSize.y + (2.0f * uiScale))));
+                ImGui::TextColored(ImColor(bodyColor), "Recent: %dW %dL %dD", std::max(0, snap.recentWins), std::max(0, snap.recentLosses),
+                                   std::max(0, snap.recentDraws));
+            }
+            ImGui::EndChild();
+        } else {
+            if (ImGui::BeginChild("##McsrCompactBody", ImVec2(0.0f, 0.0f), true)) {
+                ImGui::TextColored(ImColor(titleColor), "RECENT: %dW %dL %dD", std::max(0, snap.recentWins),
+                                   std::max(0, snap.recentLosses), std::max(0, snap.recentDraws));
+                if (!snap.recentMatches.empty()) {
+                    const size_t maxRows = std::min<size_t>(6, snap.recentMatches.size());
+                    for (size_t i = 0; i < maxRows; ++i) {
+                        const auto& row = snap.recentMatches[i];
+                        const ImU32 resultClr = (row.resultType > 0) ? winColor : ((row.resultType < 0) ? lossColor : drawColor);
+                        const bool canLoadOpponent = !row.opponent.empty() && !equalsIgnoreCase(row.opponent, "Unknown");
+                        if (canLoadOpponent) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, drawColor);
+                            ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(28, 45, 72, 120));
+                            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(36, 58, 92, 180));
+                            ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(46, 72, 110, 210));
+                            const std::string oppLabel = row.opponent + "##McsrCompactOpp" + std::to_string(i);
+                            if (ImGui::Selectable(oppLabel.c_str(), false)) {
+                                applyPlayerSelection(row.opponent);
+                            }
+                            if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Load profile"); }
+                            ImGui::PopStyleColor(4);
+                        } else {
+                            ImGui::TextColored(ImColor(bodyColor), "%s", row.opponent.c_str());
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImColor(resultClr), "%s", row.resultLabel.c_str());
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImColor(mutedColor), "%s", row.forfeited ? "FORFEIT" : row.detailLabel.c_str());
+                    }
+                    ImGui::Separator();
+                }
+
+                ImGui::PushStyleColor(ImGuiCol_PlotLines, IM_COL32(198, 214, 248, static_cast<int>(255.0f * overlayOpacity)));
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(16, 20, 32, 255));
+                ImGui::PlotLines("##McsrCompactPlot", eloSeries.data(), static_cast<int>(eloSeries.size()), 0, nullptr,
+                                 static_cast<float>(minElo), static_cast<float>(maxElo), ImVec2(-1.0f, 150.0f * uiScale));
+                ImGui::PopStyleColor(2);
+            }
+            ImGui::EndChild();
+            }
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(6);
+    ImGui::PopStyleVar(3);
+}
+
 // RENDER THREAD SHADER PROGRAMS
 // These shaders are created on the render thread context (not shared with main thread)
 
@@ -2438,6 +3459,9 @@ static void CleanupRenderFBOs() {
     }
     g_vcCursorWidth = 0;
     g_vcCursorHeight = 0;
+
+    RT_ClearMcsrTextureCacheEntry(g_mcsrAvatarTextureCache);
+    RT_ClearMcsrTextureCacheEntry(g_mcsrFlagTextureCache);
 }
 
 // Advance to next write FBO (called after completing a frame)
@@ -4351,11 +5375,15 @@ static void RenderThreadFunc(void* gameGLContext) {
             bool shouldRenderStrongholdOverlay = strongholdOverlaySnap.enabled && strongholdOverlaySnap.visible &&
                                                 strongholdOverlaySnap.renderInGameOverlay &&
                                                 RT_ShouldRenderStrongholdOverlayOnCurrentMonitor(strongholdOverlaySnap);
+            McsrApiTrackerRenderSnapshot mcsrApiTrackerSnap = GetMcsrApiTrackerRenderSnapshot();
+            bool shouldRenderMcsrApiTracker =
+                mcsrApiTrackerSnap.enabled && mcsrApiTrackerSnap.visible && mcsrApiTrackerSnap.renderInGameOverlay;
             bool shouldRenderNotesOverlay = HasNotesOverlayPendingWork();
 
             // Check if we need to render any ImGui content
             bool shouldRenderAnyImGui = request.shouldRenderGui || request.showPerformanceOverlay || request.showProfiler ||
                                         request.showEyeZoom || request.showTextureGrid || shouldRenderStrongholdOverlay ||
+                                        shouldRenderMcsrApiTracker ||
                                         shouldRenderNotesOverlay;
 
             // Lazy-init ImGui the first time we actually need to render it.
@@ -4690,6 +5718,7 @@ static void RenderThreadFunc(void* gameGLContext) {
                 if (shouldRenderStrongholdOverlay) {
                     RT_RenderStrongholdOverlayImGui(strongholdOverlaySnap, request.shouldRenderGui);
                 }
+                if (shouldRenderMcsrApiTracker) { RT_RenderMcsrApiTrackerOverlayImGui(mcsrApiTrackerSnap, request.shouldRenderGui); }
 
                 if (shouldRenderNotesOverlay) { RenderNotesOverlayImGui(); }
 

@@ -273,6 +273,72 @@ if (ImGui::BeginTabItem("[G] General")) {
         }
     }
 
+    ImGui::SeparatorText("[V] Visual FX");
+    ImGui::Text("Startup:");
+    ImGui::SameLine();
+    if (ImGui::Checkbox("[Auto Apply]", &g_config.boatSetup.autoApplyVisualEffects)) { g_configIsDirty = true; }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("%s", "Apply visual effects automatically once each game launch.");
+    }
+
+    int distortionPct = std::clamp(g_config.boatSetup.autoDistortionPercent, 0, 100);
+    ImGui::Text("Distortion:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::SliderInt("##distortionPctGeneral", &distortionPct, 0, 100, "%d")) {
+        g_config.boatSetup.autoDistortionPercent = distortionPct;
+        g_configIsDirty = true;
+    }
+
+    int fovPct = std::clamp(g_config.boatSetup.autoFovEffectPercent, 0, 100);
+    ImGui::Text("FOV Effects:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::SliderInt("##fovPctGeneral", &fovPct, 0, 100, "%d")) {
+        g_config.boatSetup.autoFovEffectPercent = fovPct;
+        g_configIsDirty = true;
+    }
+
+    static std::future<BoatSetupScriptRunResult> s_visualFxRunFuture;
+    static bool s_visualFxRunActive = false;
+    static bool s_visualFxHasRun = false;
+    static BoatSetupScriptRunResult s_visualFxLastRun;
+
+    if (s_visualFxRunActive && s_visualFxRunFuture.valid()) {
+        const auto ready = s_visualFxRunFuture.wait_for(std::chrono::milliseconds(0));
+        if (ready == std::future_status::ready) {
+            s_visualFxLastRun = s_visualFxRunFuture.get();
+            s_visualFxHasRun = true;
+            s_visualFxRunActive = false;
+        }
+    }
+
+    ImGui::BeginDisabled(s_visualFxRunActive);
+    if (ImGui::Button("[Apply] Visual FX")) {
+        BoatSetupConfig runCfg = g_config.boatSetup;
+        std::wstring toolsPath = g_toolscreenPath;
+        s_visualFxRunActive = true;
+        s_visualFxRunFuture = std::async(std::launch::async, [runCfg, toolsPath]() { return RunVisualEffectsApplyScript(runCfg, toolsPath, true); });
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Writes Visual FX to options.txt, standardsettings.json, and config/mcsr/extra-options.json.");
+
+    if (s_visualFxRunActive) {
+        ImGui::TextDisabled("Applying visual effects...");
+    } else if (s_visualFxHasRun) {
+        const bool runOk = s_visualFxLastRun.parsedOk && s_visualFxLastRun.payload.value("ok", false);
+        ImGui::TextColored(runOk ? ImVec4(0.45f, 1.0f, 0.55f, 1.0f) : ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                           "%s", runOk ? "Visual effects applied." : "Visual effects apply failed.");
+        if (!s_visualFxLastRun.error.empty()) {
+            ImGui::TextWrapped("%s", s_visualFxLastRun.error.c_str());
+        } else if (!runOk && s_visualFxLastRun.parsedOk && s_visualFxLastRun.payload.contains("apply") &&
+                   s_visualFxLastRun.payload["apply"].is_object()) {
+            const std::string msg = s_visualFxLastRun.payload["apply"].value("message", "");
+            if (!msg.empty()) ImGui::TextWrapped("%s", msg.c_str());
+        }
+    }
+
     ImGui::Separator();
     ImGui::TextDisabled("Overlay and macro settings moved to [O] Stronghold, [N] Notes, and [K] Macros tabs.");
 

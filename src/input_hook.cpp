@@ -4,6 +4,7 @@
 #include "gui.h"
 #include "logic_thread.h"
 #include "notes_overlay.h"
+#include "practice_world_launch.h"
 #include "profiler.h"
 #include "render.h"
 #include "utils.h"
@@ -246,7 +247,8 @@ InputHandlerResult HandleDestroy(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 InputHandlerResult HandleImGuiInput(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     PROFILE_SCOPE("HandleImGuiInput");
 
-    if (!g_showGui.load()) { return { false, 0 }; }
+    const bool allowMcsrTrackerInput = ShouldAllowMcsrTrackerUiInput();
+    if (!g_showGui.load() && !allowMcsrTrackerInput) { return { false, 0 }; }
 
     // ImGui context can legitimately be unavailable on this thread (e.g. when ImGui is owned by the render thread).
     // Avoid calling backend handlers without a current context to prevent null deref/assert crashes.
@@ -299,7 +301,9 @@ InputHandlerResult HandleGuiToggle(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
 
     if (is_closing) {
         g_showGui = false;
-        if (!g_wasCursorVisible.load()) {
+        const std::string nowState = g_gameStateBuffers[g_currentGameStateIndex.load(std::memory_order_acquire)];
+        const bool inWorldNow = IsInWorldGameState(nowState);
+        if (inWorldNow || !g_wasCursorVisible.load()) {
             RECT fullScreenRect;
             fullScreenRect.left = 0;
             fullScreenRect.top = 0;
@@ -430,6 +434,34 @@ InputHandlerResult HandleNotesOverlayHotkey(HWND hWnd, UINT uMsg, WPARAM wParam,
     }
 
     if (!HandleNotesOverlayToggleHotkey(static_cast<unsigned int>(wParam), ctrlDown, shiftDown, altDown)) { return { false, 0 }; }
+    return { true, 1 };
+}
+
+InputHandlerResult HandleMcsrTrackerOverlayHotkey(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    PROFILE_SCOPE("HandleMcsrTrackerOverlayHotkey");
+    (void)hWnd;
+
+    if (IsNotesOverlayInputCaptureActive()) { return { false, 0 }; }
+    if (uMsg != WM_KEYDOWN && uMsg != WM_SYSKEYDOWN) { return { false, 0 }; }
+
+    auto cfgSnap = GetConfigSnapshot();
+    if (!cfgSnap || !cfgSnap->mcsrTrackerOverlay.enabled) { return { false, 0 }; }
+
+    const bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    const int configuredVk = std::clamp(cfgSnap->mcsrTrackerOverlay.hotkeyKey, 1, 255);
+
+    // Ignore repeat toggles while combo is held.
+    if ((lParam & (1LL << 30)) != 0) {
+        if (static_cast<int>(wParam) == configuredVk && ctrlDown == cfgSnap->mcsrTrackerOverlay.hotkeyCtrl &&
+            shiftDown == cfgSnap->mcsrTrackerOverlay.hotkeyShift && altDown == cfgSnap->mcsrTrackerOverlay.hotkeyAlt) {
+            return { true, 1 };
+        }
+        return { false, 0 };
+    }
+
+    if (!HandleMcsrTrackerOverlayToggleHotkey(static_cast<unsigned int>(wParam), ctrlDown, shiftDown, altDown)) { return { false, 0 }; }
     return { true, 1 };
 }
 
@@ -1347,6 +1379,12 @@ LRESULT CALLBACK SubclassedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
 
     RegisterBindingInputEvent(uMsg, wParam, lParam);
 
+    // Handle direct practice world launch requests on the game thread.
+    {
+        LRESULT directLaunchResult = 0;
+        if (TryHandlePracticeWorldLaunchWindowMessage(hWnd, uMsg, directLaunchResult)) { return directLaunchResult; }
+    }
+
     // Keep cached monitor dimensions in sync when the window is moved/resized across monitors.
     // This must run even in windowed mode (HandleNonFullscreenCheck returns early).
     switch (uMsg) {
@@ -1376,6 +1414,9 @@ LRESULT CALLBACK SubclassedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM l
     if (result.consumed) return result.result;
 
     result = HandleNotesOverlayHotkey(hWnd, uMsg, wParam, lParam);
+    if (result.consumed) return result.result;
+
+    result = HandleMcsrTrackerOverlayHotkey(hWnd, uMsg, wParam, lParam);
     if (result.consumed) return result.result;
 
     // Keep stronghold panel controls responsive even if Minecraft temporarily exits fullscreen.

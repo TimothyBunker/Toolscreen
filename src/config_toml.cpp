@@ -1374,6 +1374,101 @@ void StrongholdOverlayConfigFromToml(const toml::table& tbl, StrongholdOverlayCo
     cfg.pollIntervalMs = GetOr(tbl, "pollIntervalMs", cfg.pollIntervalMs);
 }
 
+void McsrTrackerOverlayConfigToToml(const McsrTrackerOverlayConfig& cfg, toml::table& out) {
+    out.insert("enabled", cfg.enabled);
+    out.insert("visible", cfg.visible);
+    out.insert("renderInGameOverlay", cfg.renderInGameOverlay);
+    out.insert("autoDetectPlayer", cfg.autoDetectPlayer);
+    out.insert("player", cfg.player);
+    out.insert("refreshOnlyMode", cfg.refreshOnlyMode);
+    out.insert("useApiKey", cfg.useApiKey);
+    out.insert("apiKeyHeader", cfg.apiKeyHeader);
+    out.insert("apiKey", cfg.apiKey);
+    out.insert("pollIntervalMs", cfg.pollIntervalMs);
+    out.insert("hotkeyCtrl", cfg.hotkeyCtrl);
+    out.insert("hotkeyShift", cfg.hotkeyShift);
+    out.insert("hotkeyAlt", cfg.hotkeyAlt);
+    out.insert("hotkeyKey", static_cast<int64_t>(cfg.hotkeyKey));
+    out.insert("x", cfg.x);
+    out.insert("y", cfg.y);
+    out.insert("scale", cfg.scale);
+    out.insert("opacity", cfg.opacity);
+    out.insert("backgroundOpacity", cfg.backgroundOpacity);
+}
+
+void McsrTrackerOverlayConfigFromToml(const toml::table& tbl, McsrTrackerOverlayConfig& cfg) {
+    cfg.enabled = GetOr(tbl, "enabled", cfg.enabled);
+    cfg.visible = GetOr(tbl, "visible", cfg.visible);
+    cfg.renderInGameOverlay = GetOr(tbl, "renderInGameOverlay", cfg.renderInGameOverlay);
+    cfg.autoDetectPlayer = GetOr(tbl, "autoDetectPlayer", cfg.autoDetectPlayer);
+    cfg.player = GetStringOr(tbl, "player", cfg.player);
+    cfg.refreshOnlyMode = GetOr(tbl, "refreshOnlyMode", cfg.refreshOnlyMode);
+    cfg.useApiKey = GetOr(tbl, "useApiKey", cfg.useApiKey);
+    cfg.apiKeyHeader = GetStringOr(tbl, "apiKeyHeader", cfg.apiKeyHeader);
+    cfg.apiKey = GetStringOr(tbl, "apiKey", cfg.apiKey);
+    cfg.pollIntervalMs = std::clamp(GetOr(tbl, "pollIntervalMs", cfg.pollIntervalMs), 10000, 3600000);
+    cfg.hotkeyCtrl = GetOr(tbl, "hotkeyCtrl", cfg.hotkeyCtrl);
+    cfg.hotkeyShift = GetOr(tbl, "hotkeyShift", cfg.hotkeyShift);
+    cfg.hotkeyAlt = GetOr(tbl, "hotkeyAlt", cfg.hotkeyAlt);
+    cfg.hotkeyKey = std::clamp(GetOr(tbl, "hotkeyKey", cfg.hotkeyKey), 1, 255);
+    cfg.x = GetOr(tbl, "x", cfg.x);
+    cfg.y = GetOr(tbl, "y", cfg.y);
+    cfg.scale = std::clamp(GetOr(tbl, "scale", cfg.scale), 0.4f, 3.0f);
+    cfg.opacity = std::clamp(GetOr(tbl, "opacity", cfg.opacity), 0.0f, 1.0f);
+    cfg.backgroundOpacity = std::clamp(GetOr(tbl, "backgroundOpacity", cfg.backgroundOpacity), 0.0f, 1.0f);
+}
+
+void BoatSetupConfigToToml(const BoatSetupConfig& cfg, toml::table& out) {
+    out.insert("enabled", cfg.enabled);
+    out.insert("preferPixelPerfect", cfg.preferPixelPerfect);
+    out.insert("prioritizeLowestPixelSkipping", cfg.prioritizeLowestPixelSkipping);
+    out.insert("currentDpi", cfg.currentDpi);
+    out.insert("preferredCursorSpeed", cfg.preferredCursorSpeed);
+    out.insert("manualCurrentWindowsSpeed", cfg.manualCurrentWindowsSpeed);
+    out.insert("recommendationChoice", cfg.recommendationChoice);
+    out.insert("lowestSkipChoiceOne", cfg.lowestSkipChoiceOne);
+    out.insert("includeCursorInRanking", cfg.includeCursorInRanking);
+    out.insert("preferHigherDpi", cfg.preferHigherDpi);
+    out.insert("maxRecommendedPixelSkipping", cfg.maxRecommendedPixelSkipping);
+    out.insert("autoTrackPreferredStandardSensitivity", cfg.autoTrackPreferredStandardSensitivity);
+    out.insert("usePreferredStandardSensitivity", cfg.usePreferredStandardSensitivity);
+    out.insert("preferredStandardSensitivity", cfg.preferredStandardSensitivity);
+    out.insert("appliedRecommendedSensitivity", cfg.appliedRecommendedSensitivity);
+    out.insert("autoApplyVisualEffects", cfg.autoApplyVisualEffects);
+    out.insert("autoDistortionPercent", cfg.autoDistortionPercent);
+    out.insert("autoFovEffectPercent", cfg.autoFovEffectPercent);
+    out.insert("legacyTargetDpi", cfg.legacyTargetDpi);
+    out.insert("disableMouseAccel", cfg.disableMouseAccel);
+    out.insert("enableRawInput", cfg.enableRawInput);
+}
+
+void BoatSetupConfigFromToml(const toml::table& tbl, BoatSetupConfig& cfg) {
+    cfg.enabled = GetOr(tbl, "enabled", cfg.enabled);
+    cfg.preferPixelPerfect = GetOr(tbl, "preferPixelPerfect", cfg.preferPixelPerfect);
+    cfg.prioritizeLowestPixelSkipping = GetOr(tbl, "prioritizeLowestPixelSkipping", cfg.prioritizeLowestPixelSkipping);
+    cfg.currentDpi = std::clamp(GetOr(tbl, "currentDpi", cfg.currentDpi), 1, 50000);
+    cfg.preferredCursorSpeed = std::clamp(GetOr(tbl, "preferredCursorSpeed", cfg.preferredCursorSpeed), 0, 20);
+    cfg.manualCurrentWindowsSpeed = std::clamp(GetOr(tbl, "manualCurrentWindowsSpeed", cfg.manualCurrentWindowsSpeed), 1, 20);
+    cfg.recommendationChoice = std::clamp(GetOr(tbl, "recommendationChoice", cfg.recommendationChoice), 1, 12);
+    cfg.lowestSkipChoiceOne = GetOr(tbl, "lowestSkipChoiceOne", cfg.lowestSkipChoiceOne);
+    cfg.includeCursorInRanking = GetOr(tbl, "includeCursorInRanking", cfg.includeCursorInRanking);
+    cfg.preferHigherDpi = GetOr(tbl, "preferHigherDpi", cfg.preferHigherDpi);
+    cfg.maxRecommendedPixelSkipping =
+        std::clamp(GetOr(tbl, "maxRecommendedPixelSkipping", cfg.maxRecommendedPixelSkipping), 0.1f, 5000.0f);
+    cfg.autoTrackPreferredStandardSensitivity =
+        GetOr(tbl, "autoTrackPreferredStandardSensitivity", cfg.autoTrackPreferredStandardSensitivity);
+    cfg.usePreferredStandardSensitivity = GetOr(tbl, "usePreferredStandardSensitivity", cfg.usePreferredStandardSensitivity);
+    cfg.preferredStandardSensitivity = std::clamp(GetOr(tbl, "preferredStandardSensitivity", cfg.preferredStandardSensitivity), 0.0f, 1.0f);
+    cfg.appliedRecommendedSensitivity =
+        std::clamp(GetOr(tbl, "appliedRecommendedSensitivity", cfg.appliedRecommendedSensitivity), -1.0f, 1.0f);
+    cfg.autoApplyVisualEffects = GetOr(tbl, "autoApplyVisualEffects", cfg.autoApplyVisualEffects);
+    cfg.autoDistortionPercent = std::clamp(GetOr(tbl, "autoDistortionPercent", cfg.autoDistortionPercent), 0, 100);
+    cfg.autoFovEffectPercent = std::clamp(GetOr(tbl, "autoFovEffectPercent", cfg.autoFovEffectPercent), 0, 100);
+    cfg.legacyTargetDpi = std::clamp(GetOr(tbl, "legacyTargetDpi", cfg.legacyTargetDpi), 1, 50000);
+    cfg.disableMouseAccel = GetOr(tbl, "disableMouseAccel", cfg.disableMouseAccel);
+    cfg.enableRawInput = GetOr(tbl, "enableRawInput", cfg.enableRawInput);
+}
+
 void NotesOverlayConfigToToml(const NotesOverlayConfig& cfg, toml::table& out) {
     out.insert("enabled", cfg.enabled);
     out.insert("visible", cfg.visible);
@@ -1474,6 +1569,16 @@ void ConfigToToml(const Config& config, toml::table& out) {
     toml::table strongholdOverlayTbl;
     StrongholdOverlayConfigToToml(config.strongholdOverlay, strongholdOverlayTbl);
     out.insert("strongholdOverlay", strongholdOverlayTbl);
+
+    // MCSR tracker overlay
+    toml::table mcsrTrackerOverlayTbl;
+    McsrTrackerOverlayConfigToToml(config.mcsrTrackerOverlay, mcsrTrackerOverlayTbl);
+    out.insert("mcsrTrackerOverlay", mcsrTrackerOverlayTbl);
+
+    // Boat setup helper
+    toml::table boatSetupTbl;
+    BoatSetupConfigToToml(config.boatSetup, boatSetupTbl);
+    out.insert("boatSetup", boatSetupTbl);
 
     // Notes overlay
     toml::table notesOverlayTbl;
@@ -1591,6 +1696,34 @@ void ConfigFromToml(const toml::table& tbl, Config& config) {
 
     // Native stronghold overlay
     if (auto t = GetTable(tbl, "strongholdOverlay")) { StrongholdOverlayConfigFromToml(*t, config.strongholdOverlay); }
+
+    // MCSR tracker overlay
+    bool hasMcsrTrackerOverlay = false;
+    if (auto t = GetTable(tbl, "mcsrTrackerOverlay")) {
+        McsrTrackerOverlayConfigFromToml(*t, config.mcsrTrackerOverlay);
+        hasMcsrTrackerOverlay = true;
+    }
+
+    // Backward compatibility: migrate legacy tracker keys that previously lived under [strongholdOverlay].
+    if (!hasMcsrTrackerOverlay) {
+        if (auto strongholdTbl = GetTable(tbl, "strongholdOverlay")) {
+            config.mcsrTrackerOverlay.enabled =
+                GetOr(*strongholdTbl, "mcsrApiTrackerEnabled", config.mcsrTrackerOverlay.enabled);
+            const bool oldShow = GetOr(*strongholdTbl, "mcsrApiTrackerShowOverlay", config.mcsrTrackerOverlay.visible);
+            config.mcsrTrackerOverlay.visible = oldShow;
+            config.mcsrTrackerOverlay.renderInGameOverlay = oldShow;
+            config.mcsrTrackerOverlay.player = GetStringOr(*strongholdTbl, "mcsrApiPlayer", config.mcsrTrackerOverlay.player);
+            config.mcsrTrackerOverlay.pollIntervalMs =
+                std::clamp(GetOr(*strongholdTbl, "mcsrApiPollIntervalMs", config.mcsrTrackerOverlay.pollIntervalMs), 10000, 3600000);
+            config.mcsrTrackerOverlay.scale = std::clamp(config.strongholdOverlay.scale, 0.4f, 3.0f);
+            config.mcsrTrackerOverlay.opacity = std::clamp(config.strongholdOverlay.opacity, 0.0f, 1.0f);
+            config.mcsrTrackerOverlay.backgroundOpacity =
+                std::clamp(config.strongholdOverlay.backgroundOpacity, 0.0f, 1.0f);
+        }
+    }
+
+    // Boat setup helper
+    if (auto t = GetTable(tbl, "boatSetup")) { BoatSetupConfigFromToml(*t, config.boatSetup); }
 
     // Notes overlay
     if (auto t = GetTable(tbl, "notesOverlay")) { NotesOverlayConfigFromToml(*t, config.notesOverlay); }
@@ -1720,6 +1853,8 @@ bool SaveConfigToTomlFile(const Config& config, const std::wstring& path) {
                                                  "cursors",
                                                  "keyRebinds",
                                                  "strongholdOverlay",
+                                                 "mcsrTrackerOverlay",
+                                                 "boatSetup",
                                                  "notesOverlay",
                                                  "appearance",
                                                  "mode",

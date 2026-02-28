@@ -1521,28 +1521,63 @@ DWORD WINAPI FileMonitorThread(LPVOID lpParam) {
                                                         "inworld,gamescreenopen",
                                                         "title",
                                                         "waiting" };
-
-        HANDLE hFile = CreateFileW(g_stateFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                                   FILE_ATTRIBUTE_NORMAL, NULL);
-
-        if (hFile == INVALID_HANDLE_VALUE) {
+        HANDLE hFile = INVALID_HANDLE_VALUE;
+        ULONGLONG lastOpenAttemptMs = 0;
+        ULONGLONG lastMissingLogMs = 0;
+        bool loggedWaitingForStateFile = false;
+        auto closeStateFile = [&]() {
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                hFile = INVALID_HANDLE_VALUE;
+            }
             g_isStateOutputAvailable.store(false, std::memory_order_release);
-            Log("[FMON] ERROR: Could not open state file on thread start. The file might not exist yet. Thread will now exit.");
-            return 1;
-        }
-
-        g_isStateOutputAvailable.store(true, std::memory_order_release);
+        };
 
         // Pre-allocate buffer to avoid repeated allocations
         std::vector<char> buffer;
         buffer.reserve(128);
 
         while (!g_stopMonitoring) {
+            if (hFile == INVALID_HANDLE_VALUE) {
+                const ULONGLONG nowMs = GetTickCount64();
+                if (lastOpenAttemptMs == 0 || nowMs - lastOpenAttemptMs >= 500) {
+                    lastOpenAttemptMs = nowMs;
+                    hFile = CreateFileW(g_stateFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (hFile == INVALID_HANDLE_VALUE) {
+                        g_isStateOutputAvailable.store(false, std::memory_order_release);
+                        if (!loggedWaitingForStateFile || nowMs - lastMissingLogMs >= 5000) {
+                            Log("[FMON] Waiting for state file: " + WideToUtf8(g_stateFilePath));
+                            loggedWaitingForStateFile = true;
+                            lastMissingLogMs = nowMs;
+                        }
+                        Sleep(100);
+                        continue;
+                    }
+
+                    g_isStateOutputAvailable.store(true, std::memory_order_release);
+                    if (loggedWaitingForStateFile) {
+                        Log("[FMON] State file is now available.");
+                        loggedWaitingForStateFile = false;
+                    }
+                } else {
+                    Sleep(25);
+                    continue;
+                }
+            }
+
             Sleep(5);
 
-            if (SetFilePointer(hFile, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER) { continue; }
+            if (SetFilePointer(hFile, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER) {
+                closeStateFile();
+                continue;
+            }
 
             DWORD fileSize = GetFileSize(hFile, NULL);
+            if (fileSize == INVALID_FILE_SIZE && GetLastError() != NO_ERROR) {
+                closeStateFile();
+                continue;
+            }
             if (fileSize > 0 && fileSize < 128) {
                 buffer.resize(fileSize);
                 DWORD bytesRead;
@@ -1566,11 +1601,14 @@ DWORD WINAPI FileMonitorThread(LPVOID lpParam) {
                             g_currentGameStateIndex.store(nextIdx, std::memory_order_release);
                         }
                     }
+                } else {
+                    closeStateFile();
+                    continue;
                 }
             }
         }
 
-        CloseHandle(hFile);
+        closeStateFile();
         Log("[FMON] FileMonitorThread stopped.");
         return 0;
     } catch (const SE_Exception& e) {

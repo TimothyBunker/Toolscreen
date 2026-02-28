@@ -107,6 +107,50 @@ opacity = 1.0
 backgroundOpacity = 0.55
 pollIntervalMs = 125
 
+[mcsrTrackerOverlay]
+enabled = false
+visible = false
+renderInGameOverlay = true
+autoDetectPlayer = true
+player = ''
+refreshOnlyMode = true
+useApiKey = false
+apiKeyHeader = 'x-api-key'
+apiKey = ''
+pollIntervalMs = 600000
+hotkeyCtrl = true
+hotkeyShift = true
+hotkeyAlt = false
+hotkeyKey = 85
+x = 0
+y = 0
+scale = 1.0
+opacity = 1.0
+backgroundOpacity = 0.55
+
+[boatSetup]
+enabled = true
+preferPixelPerfect = true
+prioritizeLowestPixelSkipping = true
+currentDpi = 800
+preferredCursorSpeed = 0
+manualCurrentWindowsSpeed = 10
+recommendationChoice = 1
+lowestSkipChoiceOne = true
+includeCursorInRanking = true
+preferHigherDpi = false
+maxRecommendedPixelSkipping = 50.0
+autoTrackPreferredStandardSensitivity = true
+usePreferredStandardSensitivity = false
+preferredStandardSensitivity = 0.0
+appliedRecommendedSensitivity = -1.0
+autoApplyVisualEffects = true
+autoDistortionPercent = 0
+autoFovEffectPercent = 10
+legacyTargetDpi = 800
+disableMouseAccel = true
+enableRawInput = true
+
 [notesOverlay]
 enabled = true
 visible = false

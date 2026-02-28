@@ -7,10 +7,12 @@
 #include "stronghold_companion_overlay.h"
 #include "utils.h"
 #include "version.h"
+#include "json.hpp"
 #include <Windows.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -84,6 +86,19 @@ constexpr INTERNET_PORT kStrongholdApiPort = 52533;
 constexpr wchar_t kStrongholdApiPath[] = L"/api/v1/stronghold";
 constexpr wchar_t kInformationMessagesApiPath[] = L"/api/v1/information-messages";
 constexpr DWORD kStrongholdApiTimeoutMs = 250;
+constexpr wchar_t kMcsrApiHost[] = L"api.mcsrranked.com";
+constexpr wchar_t kMcsrApiFallbackHost[] = L"mcsrranked.com";
+constexpr INTERNET_PORT kMcsrApiPort = INTERNET_DEFAULT_HTTPS_PORT;
+constexpr DWORD kMcsrApiTimeoutMs = 1400;
+constexpr DWORD kMcsrApiCacheTimeoutMs = 500;
+constexpr int kMcsrMatchTypeCasual = 1;
+constexpr int kMcsrMatchTypeRanked = 2;
+constexpr int kMcsrMatchTypePrivate = 3;
+constexpr int kMcsrMatchTypeEvent = 4;
+constexpr size_t kMcsrUsernameIndexMaxNames = 8192;
+constexpr int kMcsrUsernameIndexWeeklyRefreshSeconds = 7 * 24 * 60 * 60;
+constexpr int kMcsrUsernameIndexRefreshRetrySeconds = 20 * 60;
+constexpr int kMcsrUsernameIndexMatchPagesPerRefresh = 80;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kDefaultSigmaNormal = 0.1;
 constexpr double kDefaultSigmaAlt = 0.1;
@@ -96,8 +111,7 @@ constexpr int kStrongholdDistParam = 32;
 constexpr int kStrongholdMaxChunk = static_cast<int>(
     kStrongholdDistParam * ((4.0 + (kStrongholdRingCount - 1) * 6.0) + 0.5 * 2.5) + 2 * kStrongholdSnappingRadius + 1);
 constexpr double kBoatInitErrorLimitDeg = 0.03;
-constexpr double kBoatInitPositiveIncrementDeg = 1.40625;
-constexpr double kBoatInitNegativeIncrementDeg = 0.140625;
+constexpr double kBoatInitIncrementDeg = 1.40625;
 constexpr double kNbbDefaultSensitivityAutomatic = 0.012727597;
 constexpr double kNbbDefaultCrosshairCorrectionDeg = 0.0;
 constexpr wchar_t kNbbPrefsRegistrySubkey[] = L"Software\\JavaSoft\\Prefs\\ninjabrainbot";
@@ -111,6 +125,7 @@ constexpr wchar_t kNbbAngleAdjustmentTypeRegistryValue[] = L"angle_adjustment_ty
 constexpr wchar_t kNbbResolutionHeightRegistryValue[] = L"resolution_height";
 constexpr wchar_t kNbbCustomAdjustmentRegistryValue[] = L"custom_adjustment";
 constexpr ULONGLONG kNbbPrefsRefreshIntervalMs = 5000;
+constexpr ULONGLONG kNbbBoatAngleSettingsRefreshIntervalMs = 750;
 constexpr int kBoatStateUninitialized = 0;
 constexpr int kBoatStateGood = 1;
 constexpr int kBoatStateFailed = 2;
@@ -181,6 +196,74 @@ struct ParsedInformationMessagesData {
     std::string mismeasureWarningText;
 };
 
+struct ParsedMcsrUserData {
+    bool ok = false;
+    std::string uuid;
+    std::string nickname;
+    std::string country;
+    int eloRank = 0;
+    int eloRate = 0;
+    int peakElo = 0;
+    int seasonWinsRanked = 0;
+    int seasonLossesRanked = 0;
+    int seasonCompletionsRanked = 0;
+    int seasonPointsRanked = 0;
+    int seasonFfsRanked = 0;
+    int seasonDodgesRanked = 0;
+    int seasonCurrentWinStreakRanked = 0;
+    int allWinsRanked = 0;
+    int allLossesRanked = 0;
+    int allFfsRanked = 0;
+    int bestWinStreak = 0;
+    int bestTimeMs = 0;
+    int averageTimeMs = 0;
+    bool hasForfeitRatePercent = false;
+    float forfeitRatePercent = 0.0f;
+};
+
+struct ParsedMcsrMatchSummary {
+    std::string id;
+    int type = 0;
+    std::string category;
+    std::string gameMode;
+    int dateEpochSeconds = 0;
+    std::string resultUuid;
+    std::string resultName;
+    int resultTimeMs = 0;
+    bool forfeited = false;
+    std::string opponentName;
+    bool hasEloAfter = false;
+    int eloAfter = 0;
+    int eloDelta = 0;
+};
+
+struct ParsedMcsrMatchesData {
+    bool ok = false;
+    std::vector<ParsedMcsrMatchSummary> matches;
+};
+
+struct ParsedMcsrTimelineSplit {
+    int type = 0;
+    int timeMs = 0;
+};
+
+struct ParsedMcsrMatchDetailData {
+    bool ok = false;
+    int completionTimeMs = 0;
+    std::vector<ParsedMcsrTimelineSplit> splits;
+};
+
+struct ParsedMcsrLeaderboardData {
+    bool ok = false;
+    std::vector<std::string> nicknames;
+};
+
+struct ParsedMcsrMatchFeedUsernamesData {
+    bool ok = false;
+    bool hasRows = false;
+    std::vector<std::string> nicknames;
+};
+
 enum class ClipboardDimension {
     Overworld,
     Nether,
@@ -219,6 +302,8 @@ struct StandaloneStrongholdState {
     int boatState = kBoatStateUninitialized;
     bool hasBoatAngle = false;
     double boatAngleDeg = 0.0;
+    bool hasLastOverworldRawYaw = false;
+    double lastOverworldRawYaw = 0.0;
     std::vector<ParsedEyeThrow> eyeThrows;
 };
 
@@ -302,6 +387,91 @@ struct StrongholdOverlayRuntimeState {
     std::string debugSelectionLabel;
     bool showComputedDetails = false;
     double lastActiveThrowVerticalAngleDeg = -31.6;
+};
+
+struct McsrApiTrackerRuntimeState {
+    struct MatchRow {
+        std::string opponent;
+        std::string resultLabel;
+        std::string detailLabel;
+        std::string ageLabel;
+        int resultType = 0; // 1=win, 0=draw, -1=loss
+        bool forfeited = false;
+        int categoryType = 0; // 0=ranked, 1=private, 2=casual, 3=event, 4=other
+    };
+    struct TrendPoint {
+        int elo = 0;
+        std::string opponent;
+        std::string resultLabel;
+        std::string detailLabel;
+        std::string ageLabel;
+    };
+
+    bool enabled = false;
+    bool visible = false;
+    bool initializedVisibility = false;
+    bool apiOnline = false;
+    std::string autoDetectedPlayer;
+    std::string autoDetectedUuid;
+    std::string requestedPlayer;
+    std::string displayPlayer;
+    std::string avatarImagePath;
+    std::string flagImagePath;
+    std::string country;
+    std::string userUuid;
+    int eloRank = 0;
+    int eloRate = 0;
+    int peakElo = 0;
+    int seasonWins = 0;
+    int seasonLosses = 0;
+    int seasonCompletions = 0;
+    int seasonPoints = 0;
+    int bestWinStreak = 0;
+    int bestTimeMs = 0;
+    int profileAverageTimeMs = 0;
+    int seasonFfs = 0;
+    int seasonDodges = 0;
+    int seasonCurrentWinStreak = 0;
+    int recentWins = 0;
+    int recentLosses = 0;
+    int recentDraws = 0;
+    int averageResultTimeMs = 0;
+    float recentForfeitRatePercent = 0.0f;
+    float profileForfeitRatePercent = 0.0f;
+    std::string lastMatchId;
+    std::string lastResultLabel;
+    int lastResultTimeMs = 0;
+    std::vector<int> eloHistory;
+    std::vector<TrendPoint> eloTrendPoints;
+    std::vector<MatchRow> recentMatches;
+    std::vector<std::string> suggestedPlayers;
+    std::vector<std::string> splitLines;
+    std::string statusLabel;
+};
+
+struct McsrAutoPlayerCacheState {
+    std::filesystem::path latestLogPath;
+    std::filesystem::file_time_type latestWriteTime{};
+    bool hasLatestWriteTime = false;
+    std::string username;
+    ULONGLONG nextRefreshMs = 0;
+};
+
+struct McsrAssetCacheState {
+    std::string avatarKey;
+    std::string avatarPath;
+    std::chrono::steady_clock::time_point nextAvatarFetch = std::chrono::steady_clock::time_point::min();
+    std::string flagKey;
+    std::string flagPath;
+    std::chrono::steady_clock::time_point nextFlagFetch = std::chrono::steady_clock::time_point::min();
+};
+
+struct McsrCacheServerEndpoint {
+    bool enabled = false;
+    bool useTls = false;
+    INTERNET_PORT port = 0;
+    std::wstring host;
+    std::wstring basePath;
 };
 
 struct ManagedNinjabrainBotProcessState {
@@ -411,6 +581,22 @@ static std::atomic<int> s_pendingStrongholdMouseDeltaY{ 0 };
 static std::atomic<uint32_t> s_strongholdMovementKeyMask{ 0 };
 static StrongholdLivePlayerPose s_strongholdLivePlayerPose;
 static uint64_t s_lastAnchoredStandaloneSnapshotCounter = 0;
+static std::mutex s_mcsrApiTrackerMutex;
+static McsrApiTrackerRuntimeState s_mcsrApiTrackerState;
+static std::chrono::steady_clock::time_point s_nextMcsrApiTrackerPollTime;
+static std::chrono::steady_clock::time_point s_mcsrApiRateLimitUntil;
+static int s_mcsrApiRateLimitExponent = 0;
+static std::atomic<bool> s_mcsrApiTrackerForceRefresh{ false };
+static std::atomic<bool> s_mcsrPreferFallbackHost{ true };
+static std::chrono::steady_clock::time_point s_mcsrCacheServerRetryAt;
+static McsrAutoPlayerCacheState s_mcsrAutoPlayerCacheState;
+static std::mutex s_mcsrSearchOverrideMutex;
+static std::string s_mcsrSearchOverridePlayer;
+static std::vector<std::string> s_mcsrLeaderboardSuggestions;
+static bool s_mcsrUsernameIndexLoaded = false;
+static std::chrono::steady_clock::time_point s_mcsrUsernameIndexNextRefresh;
+static std::mutex s_mcsrAssetCacheMutex;
+static McsrAssetCacheState s_mcsrAssetCacheState;
 static std::atomic<bool> s_mcsrRankedInstanceDetected{ false };
 static std::atomic<ULONGLONG> s_mcsrRankedDetectionNextRefreshMs{ 0 };
 static std::string s_mcsrRankedDetectionSource;
@@ -431,12 +617,167 @@ struct EyeSpyAutoHideState {
 
 static EyeSpyAutoHideState s_eyeSpyAutoHideState;
 
+static bool TryReadEnvironmentVariable(const wchar_t* name, std::wstring& outValue);
+static std::string SanitizeHttpHeaderToken(std::string token);
+
 static std::wstring ToLowerAscii(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(), [](wchar_t ch) {
         if (ch >= L'A' && ch <= L'Z') return static_cast<wchar_t>(ch - L'A' + L'a');
         return ch;
     });
     return s;
+}
+
+static void TrimAsciiWhitespaceInPlace(std::wstring& value) {
+    auto isSpace = [](wchar_t c) { return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'; };
+    while (!value.empty() && isSpace(value.front())) value.erase(value.begin());
+    while (!value.empty() && isSpace(value.back())) value.pop_back();
+}
+
+static bool TryParseMcsrCacheServerUrl(const std::wstring& rawUrl, McsrCacheServerEndpoint& outEndpoint) {
+    outEndpoint = McsrCacheServerEndpoint{};
+    std::wstring url = rawUrl;
+    TrimAsciiWhitespaceInPlace(url);
+    if (url.empty()) return false;
+
+    const std::wstring lowerUrl = ToLowerAscii(url);
+    if (lowerUrl == L"off" || lowerUrl == L"none" || lowerUrl == L"disabled" || lowerUrl == L"disable") {
+        outEndpoint.enabled = false;
+        return true;
+    }
+
+    size_t schemeEnd = lowerUrl.find(L"://");
+    if (schemeEnd == std::wstring::npos) return false;
+    const std::wstring scheme = lowerUrl.substr(0, schemeEnd);
+    if (scheme == L"http") {
+        outEndpoint.useTls = false;
+        outEndpoint.port = INTERNET_DEFAULT_HTTP_PORT;
+    } else if (scheme == L"https") {
+        outEndpoint.useTls = true;
+        outEndpoint.port = INTERNET_DEFAULT_HTTPS_PORT;
+    } else {
+        return false;
+    }
+
+    const size_t authorityStart = schemeEnd + 3;
+    if (authorityStart >= url.size()) return false;
+
+    size_t pathStart = url.find(L'/', authorityStart);
+    size_t queryStart = url.find(L'?', authorityStart);
+    size_t fragStart = url.find(L'#', authorityStart);
+
+    size_t authorityEnd = std::wstring::npos;
+    if (pathStart != std::wstring::npos) authorityEnd = pathStart;
+    if (queryStart != std::wstring::npos) authorityEnd = std::min(authorityEnd, queryStart);
+    if (fragStart != std::wstring::npos) authorityEnd = std::min(authorityEnd, fragStart);
+    if (authorityEnd == std::wstring::npos) authorityEnd = url.size();
+
+    std::wstring authority = url.substr(authorityStart, authorityEnd - authorityStart);
+    TrimAsciiWhitespaceInPlace(authority);
+    if (authority.empty()) return false;
+
+    if (authority.front() == L'[') {
+        const size_t bracketEnd = authority.find(L']');
+        if (bracketEnd == std::wstring::npos) return false;
+        outEndpoint.host = authority.substr(0, bracketEnd + 1);
+        if (bracketEnd + 1 < authority.size() && authority[bracketEnd + 1] == L':') {
+            const std::wstring portText = authority.substr(bracketEnd + 2);
+            if (!portText.empty()) {
+                try {
+                    const int parsedPort = std::stoi(portText);
+                    if (parsedPort <= 0 || parsedPort > 65535) return false;
+                    outEndpoint.port = static_cast<INTERNET_PORT>(parsedPort);
+                } catch (...) {
+                    return false;
+                }
+            }
+        } else if (bracketEnd + 1 < authority.size()) {
+            return false;
+        }
+    } else {
+        const size_t firstColon = authority.find(L':');
+        const size_t lastColon = authority.rfind(L':');
+        if (firstColon != std::wstring::npos && firstColon == lastColon) {
+            outEndpoint.host = authority.substr(0, firstColon);
+            const std::wstring portText = authority.substr(firstColon + 1);
+            if (!portText.empty()) {
+                try {
+                    const int parsedPort = std::stoi(portText);
+                    if (parsedPort <= 0 || parsedPort > 65535) return false;
+                    outEndpoint.port = static_cast<INTERNET_PORT>(parsedPort);
+                } catch (...) {
+                    return false;
+                }
+            }
+        } else {
+            outEndpoint.host = authority;
+        }
+    }
+
+    TrimAsciiWhitespaceInPlace(outEndpoint.host);
+    if (outEndpoint.host.empty()) return false;
+
+    if (pathStart != std::wstring::npos) {
+        std::wstring basePath = url.substr(pathStart);
+        const size_t cutPos = basePath.find_first_of(L"?#");
+        if (cutPos != std::wstring::npos) basePath.erase(cutPos);
+        while (basePath.size() > 1 && basePath.back() == L'/') basePath.pop_back();
+        if (basePath == L"/") basePath.clear();
+        outEndpoint.basePath = std::move(basePath);
+    }
+
+    outEndpoint.enabled = true;
+    return true;
+}
+
+static McsrCacheServerEndpoint ResolveMcsrCacheServerEndpoint() {
+    std::wstring rawUrl;
+    if (TryReadEnvironmentVariable(L"MCSR_CACHE_SERVER_URL", rawUrl)) {
+        McsrCacheServerEndpoint parsed;
+        if (TryParseMcsrCacheServerUrl(rawUrl, parsed)) return parsed;
+        Log("[MCSR] Invalid MCSR_CACHE_SERVER_URL: " + WideToUtf8(rawUrl) + ". Falling back to default local cache server.");
+    }
+
+    McsrCacheServerEndpoint localDefault;
+    localDefault.enabled = true;
+    localDefault.useTls = false;
+    localDefault.host = L"127.0.0.1";
+    localDefault.port = 8787;
+    localDefault.basePath.clear();
+    return localDefault;
+}
+
+static std::wstring BuildMcsrCacheServerRequestPath(const std::wstring& basePath, const std::wstring& requestPath) {
+    if (basePath.empty()) return requestPath;
+    if (requestPath.empty()) return basePath;
+    const bool baseEndsWithSlash = !basePath.empty() && basePath.back() == L'/';
+    const bool requestStartsWithSlash = !requestPath.empty() && requestPath.front() == L'/';
+    if (baseEndsWithSlash && requestStartsWithSlash) {
+        return basePath + requestPath.substr(1);
+    }
+    if (!baseEndsWithSlash && !requestStartsWithSlash) {
+        return basePath + L"/" + requestPath;
+    }
+    return basePath + requestPath;
+}
+
+static std::wstring BuildMcsrCacheServerAuthHeaders() {
+    std::wstring token;
+    if (!TryReadEnvironmentVariable(L"MCSR_CACHE_AUTH_TOKEN", token)) return L"";
+    TrimAsciiWhitespaceInPlace(token);
+    if (token.empty()) return L"";
+
+    std::wstring headerNameW;
+    std::string headerName = "x-toolscreen-token";
+    if (TryReadEnvironmentVariable(L"MCSR_CACHE_AUTH_HEADER", headerNameW)) {
+        TrimAsciiWhitespaceInPlace(headerNameW);
+        if (!headerNameW.empty()) {
+            headerName = SanitizeHttpHeaderToken(WideToUtf8(headerNameW));
+            if (headerName.empty()) headerName = "x-toolscreen-token";
+        }
+    }
+
+    return Utf8ToWide(headerName) + L": " + token + L"\r\n";
 }
 
 static bool IsNinjabrainBotJarName(const std::wstring& filename) {
@@ -966,6 +1307,51 @@ static bool TryReadMouseSensitivityFromOptionsFile(const std::filesystem::path& 
     return false;
 }
 
+static bool TryReadMouseSensitivityFromStandardSettingsFile(const std::filesystem::path& standardSettingsPath, double& outSensitivity) {
+    outSensitivity = 0.0;
+    std::ifstream file(standardSettingsPath);
+    if (!file.is_open()) return false;
+
+    nlohmann::json root;
+    try {
+        file >> root;
+    } catch (...) {
+        return false;
+    }
+    if (!root.is_object()) return false;
+
+    std::function<bool(const nlohmann::json&, double&)> parseJsonValue;
+    parseJsonValue = [&](const nlohmann::json& value, double& out) -> bool {
+        if (value.is_number_float() || value.is_number_integer() || value.is_number_unsigned()) {
+            out = std::clamp(value.get<double>(), 0.0, 1.0);
+            return true;
+        }
+        if (value.is_string()) {
+            double parsed = 0.0;
+            if (!TryParseFlexibleDouble(value.get<std::string>(), parsed)) return false;
+            out = std::clamp(parsed, 0.0, 1.0);
+            return true;
+        }
+        if (value.is_object()) {
+            auto it = value.find("value");
+            if (it != value.end()) return parseJsonValue(*it, out);
+        }
+        return false;
+    };
+
+    auto it = root.find("mouseSensitivity");
+    if (it != root.end()) {
+        if (parseJsonValue(*it, outSensitivity)) return true;
+    }
+
+    it = root.find("sensitivity");
+    if (it != root.end()) {
+        if (parseJsonValue(*it, outSensitivity)) return true;
+    }
+
+    return false;
+}
+
 static void AddUniquePathCandidate(std::vector<std::filesystem::path>& outPaths, std::vector<std::wstring>& seenPaths,
                                    const std::filesystem::path& candidate) {
     if (candidate.empty()) return;
@@ -999,6 +1385,86 @@ static void AddLauncherInstanceOptionsCandidates(std::vector<std::filesystem::pa
         if (!it->is_directory(typeEc) || typeEc) continue;
         AddCommonInstanceOptionsCandidates(outPaths, seenPaths, it->path());
     }
+}
+
+static bool TryResolveActiveMinecraftConfigPathsForStronghold(std::filesystem::path& outOptionsPath,
+                                                              std::filesystem::path& outStandardSettingsPath) {
+    outOptionsPath.clear();
+    outStandardSettingsPath.clear();
+
+    std::vector<std::filesystem::path> optionCandidates;
+    std::vector<std::wstring> seenCandidates;
+    auto addInstanceOptions = [&](const std::filesystem::path& base) {
+        AddUniquePathCandidate(optionCandidates, seenCandidates, base / L"options.txt");
+        AddUniquePathCandidate(optionCandidates, seenCandidates, base / L".minecraft" / L"options.txt");
+        AddUniquePathCandidate(optionCandidates, seenCandidates, base / L"minecraft" / L"options.txt");
+        AddUniquePathCandidate(optionCandidates, seenCandidates, base / L"game" / L"options.txt");
+    };
+
+    std::wstring instMcDir;
+    if (TryReadEnvironmentVariable(L"INST_MC_DIR", instMcDir)) {
+        AddUniquePathCandidate(optionCandidates, seenCandidates, std::filesystem::path(instMcDir) / L"options.txt");
+    }
+
+    std::wstring instDir;
+    if (TryReadEnvironmentVariable(L"INST_DIR", instDir)) { addInstanceOptions(std::filesystem::path(instDir)); }
+
+    try {
+        const std::filesystem::path cwd = std::filesystem::current_path();
+        addInstanceOptions(cwd);
+        addInstanceOptions(cwd.parent_path());
+    } catch (...) {
+    }
+
+    if (!g_toolscreenPath.empty()) {
+        try {
+            const std::filesystem::path toolscreenDir(g_toolscreenPath);
+            addInstanceOptions(toolscreenDir);
+            addInstanceOptions(toolscreenDir.parent_path());
+        } catch (...) {
+        }
+    }
+
+    std::wstring userProfile;
+    if (TryReadEnvironmentVariable(L"USERPROFILE", userProfile)) {
+        const std::filesystem::path userRoot(userProfile);
+        AddUniquePathCandidate(optionCandidates, seenCandidates, userRoot / L".minecraft" / L"options.txt");
+        AddUniquePathCandidate(optionCandidates, seenCandidates, userRoot / L"AppData" / L"Roaming" / L".minecraft" / L"options.txt");
+        AddUniquePathCandidate(optionCandidates, seenCandidates,
+                               userRoot / L"Desktop" / L"msr" / L"MultiMC" / L"instances" / L"MCSRRanked-Windows-1.16.1-All" /
+                                   L".minecraft" / L"options.txt");
+    }
+
+    std::error_code ec;
+    std::filesystem::path resolvedOptions;
+    for (const auto& candidate : optionCandidates) {
+        ec.clear();
+        if (!std::filesystem::exists(candidate, ec) || ec) continue;
+        if (!std::filesystem::is_regular_file(candidate, ec) || ec) continue;
+        resolvedOptions = candidate;
+        break;
+    }
+    if (resolvedOptions.empty()) return false;
+
+    outOptionsPath = resolvedOptions.lexically_normal();
+
+    const std::filesystem::path optionsDir = outOptionsPath.parent_path();
+    std::vector<std::filesystem::path> stdCandidates;
+    std::vector<std::wstring> seenStdCandidates;
+    AddUniquePathCandidate(stdCandidates, seenStdCandidates, optionsDir / L"config" / L"mcsr" / L"standardsettings.json");
+    AddUniquePathCandidate(stdCandidates, seenStdCandidates, optionsDir / L"config" / L"standardsettings.json");
+    AddUniquePathCandidate(stdCandidates, seenStdCandidates, optionsDir / L".minecraft" / L"config" / L"mcsr" / L"standardsettings.json");
+    AddUniquePathCandidate(stdCandidates, seenStdCandidates, optionsDir / L".minecraft" / L"config" / L"standardsettings.json");
+
+    for (const auto& stdPath : stdCandidates) {
+        ec.clear();
+        if (!std::filesystem::exists(stdPath, ec) || ec) continue;
+        if (!std::filesystem::is_regular_file(stdPath, ec) || ec) continue;
+        outStandardSettingsPath = stdPath.lexically_normal();
+        break;
+    }
+
+    return true;
 }
 
 static void AddCommonMinecraftLogCandidates(std::vector<std::filesystem::path>& outPaths, std::vector<std::wstring>& seenPaths,
@@ -1190,8 +1656,333 @@ static bool PollEyeSpyAdvancementDetected() {
     return false;
 }
 
+static bool IsValidMinecraftUsername(const std::string& value) {
+    if (value.size() < 2 || value.size() > 16) return false;
+    for (unsigned char c : value) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') continue;
+        return false;
+    }
+    return true;
+}
+
+static bool IsLikelyMinecraftUuid(const std::string& value) {
+    if (value.size() == 32) {
+        return std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+    }
+    if (value.size() == 36) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (i == 8 || i == 13 || i == 18 || i == 23) {
+                if (value[i] != '-') return false;
+            } else if (std::isxdigit(static_cast<unsigned char>(value[i])) == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+static std::string SanitizeHttpHeaderToken(std::string token) {
+    TrimAsciiWhitespaceInPlace(token);
+    std::string out;
+    out.reserve(token.size());
+    for (unsigned char c : token) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+static bool TryResolveMinecraftIdentityFromCommandLine(std::string& outUsername, std::string& outUuid) {
+    outUsername.clear();
+    outUuid.clear();
+
+    const wchar_t* rawCmdW = GetCommandLineW();
+    if (!rawCmdW || rawCmdW[0] == L'\0') return false;
+
+    const std::string cmd = WideToUtf8(std::wstring(rawCmdW));
+    if (cmd.empty()) return false;
+
+    static const std::regex reUsername(R"REGEX((?:^|\s)--username\s+"?([A-Za-z0-9_]{2,16})"?)REGEX");
+    static const std::regex reUuid(R"REGEX((?:^|\s)--uuid\s+"?([0-9A-Fa-f-]{32,36})"?)REGEX");
+
+    std::smatch m;
+    if (std::regex_search(cmd, m, reUsername) && m.size() >= 2) {
+        std::string candidate = m[1].str();
+        TrimAsciiWhitespaceInPlace(candidate);
+        if (IsValidMinecraftUsername(candidate)) outUsername = candidate;
+    }
+    if (std::regex_search(cmd, m, reUuid) && m.size() >= 2) {
+        std::string candidate = m[1].str();
+        TrimAsciiWhitespaceInPlace(candidate);
+        if (IsLikelyMinecraftUuid(candidate)) outUuid = candidate;
+    }
+
+    return !outUsername.empty() || !outUuid.empty();
+}
+
+static bool TryExtractMinecraftUsernameFromLog(const std::filesystem::path& latestLogPath, std::string& outUsername) {
+    outUsername.clear();
+
+    std::ifstream file(latestLogPath, std::ios::binary);
+    if (!file.is_open()) return false;
+
+    static const std::regex reSettingUser(R"(Setting user:\s*([A-Za-z0-9_]{2,16}))");
+    std::string line;
+    std::string lastMatched;
+    while (std::getline(file, line)) {
+        std::smatch m;
+        if (std::regex_search(line, m, reSettingUser) && m.size() >= 2) {
+            std::string candidate = m[1].str();
+            TrimAsciiWhitespaceInPlace(candidate);
+            if (IsValidMinecraftUsername(candidate)) { lastMatched = candidate; }
+        }
+    }
+
+    if (lastMatched.empty()) return false;
+    outUsername = lastMatched;
+    return true;
+}
+
+static bool TryReadSmallTextFile(const std::filesystem::path& path, std::string& outText, size_t maxBytes = 2 * 1024 * 1024) {
+    outText.clear();
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) return false;
+    if (!std::filesystem::is_regular_file(path, ec) || ec) return false;
+    const std::uintmax_t fileSize = std::filesystem::file_size(path, ec);
+    if (ec || fileSize == 0 || fileSize > maxBytes) return false;
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) return false;
+    std::string text;
+    text.resize(static_cast<size_t>(fileSize));
+    file.read(text.data(), static_cast<std::streamsize>(text.size()));
+    const std::streamsize got = file.gcount();
+    if (got <= 0) return false;
+    text.resize(static_cast<size_t>(got));
+    outText = std::move(text);
+    return true;
+}
+
+static bool TryExtractMinecraftIdentityFromAccountJson(const std::string& json, std::string& outUsername, std::string& outUuid) {
+    outUsername.clear();
+    outUuid.clear();
+
+    // MultiMC / Prism style: active account profile identity.
+    static const std::regex reActiveProfileName(
+        R"REGEX("active"\s*:\s*true[\s\S]*?"profile"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([A-Za-z0-9_]{2,16})")REGEX");
+    static const std::regex reActiveProfileId(
+        R"REGEX("active"\s*:\s*true[\s\S]*?"profile"\s*:\s*\{[\s\S]*?"id"\s*:\s*"([0-9A-Fa-f-]{32,36})")REGEX");
+    // Vanilla/launcher_accounts style.
+    static const std::regex reMinecraftProfileName(
+        R"REGEX("minecraftProfile"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([A-Za-z0-9_]{2,16})")REGEX");
+    static const std::regex reMinecraftProfileId(
+        R"REGEX("minecraftProfile"\s*:\s*\{[\s\S]*?"id"\s*:\s*"([0-9A-Fa-f-]{32,36})")REGEX");
+    // Fallbacks.
+    static const std::regex reDisplayName(R"REGEX("displayName"\s*:\s*"([A-Za-z0-9_]{2,16})")REGEX");
+    static const std::regex reProfileName(
+        R"REGEX("profile"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([A-Za-z0-9_]{2,16})")REGEX");
+    static const std::regex reProfileId(
+        R"REGEX("profile"\s*:\s*\{[\s\S]*?"id"\s*:\s*"([0-9A-Fa-f-]{32,36})")REGEX");
+
+    auto tryExtract = [&](const std::regex& pattern, std::string& outValue) -> bool {
+        std::smatch m;
+        if (!std::regex_search(json, m, pattern) || m.size() < 2) return false;
+        outValue = m[1].str();
+        TrimAsciiWhitespaceInPlace(outValue);
+        return !outValue.empty();
+    };
+
+    std::string usernameCandidate;
+    if (!tryExtract(reActiveProfileName, usernameCandidate)) {
+        if (!tryExtract(reMinecraftProfileName, usernameCandidate)) {
+            if (!tryExtract(reDisplayName, usernameCandidate)) { (void)tryExtract(reProfileName, usernameCandidate); }
+        }
+    }
+    if (IsValidMinecraftUsername(usernameCandidate)) outUsername = usernameCandidate;
+
+    std::string uuidCandidate;
+    if (!tryExtract(reActiveProfileId, uuidCandidate)) {
+        if (!tryExtract(reMinecraftProfileId, uuidCandidate)) { (void)tryExtract(reProfileId, uuidCandidate); }
+    }
+    if (IsLikelyMinecraftUuid(uuidCandidate)) outUuid = uuidCandidate;
+
+    return !outUsername.empty() || !outUuid.empty();
+}
+
+static void AddCommonMinecraftAccountCandidates(std::vector<std::filesystem::path>& outPaths, std::vector<std::wstring>& seenPaths,
+                                                const std::filesystem::path& baseDir) {
+    if (baseDir.empty()) return;
+    AddUniquePathCandidate(outPaths, seenPaths, baseDir / L"accounts.json");
+    AddUniquePathCandidate(outPaths, seenPaths, baseDir / L"launcher_accounts.json");
+    AddUniquePathCandidate(outPaths, seenPaths, baseDir / L"launcher_profiles.json");
+    AddUniquePathCandidate(outPaths, seenPaths, baseDir / L".minecraft" / L"launcher_accounts.json");
+    AddUniquePathCandidate(outPaths, seenPaths, baseDir / L".minecraft" / L"launcher_profiles.json");
+}
+
+static bool TryResolveMinecraftIdentityFromAccountFiles(std::string& outUsername, std::string& outUuid) {
+    outUsername.clear();
+    outUuid.clear();
+
+    std::vector<std::filesystem::path> candidates;
+    std::vector<std::wstring> seenCandidates;
+
+    std::wstring instMcDirW;
+    if (TryReadEnvironmentVariable(L"INST_MC_DIR", instMcDirW)) {
+        const std::filesystem::path instMcDir(instMcDirW);
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, instMcDir);
+        const std::filesystem::path instanceRoot = instMcDir.parent_path();
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, instanceRoot);
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, instanceRoot.parent_path());
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, instanceRoot.parent_path().parent_path());
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, instanceRoot.parent_path().parent_path().parent_path());
+    }
+
+    if (!g_toolscreenPath.empty()) {
+        try {
+            const std::filesystem::path toolscreenDir(g_toolscreenPath);
+            AddCommonMinecraftAccountCandidates(candidates, seenCandidates, toolscreenDir);
+            AddCommonMinecraftAccountCandidates(candidates, seenCandidates, toolscreenDir.parent_path());
+            AddCommonMinecraftAccountCandidates(candidates, seenCandidates, toolscreenDir.parent_path().parent_path());
+            AddCommonMinecraftAccountCandidates(candidates, seenCandidates, toolscreenDir.parent_path().parent_path().parent_path());
+        } catch (...) {
+        }
+    }
+
+    try {
+        const std::filesystem::path cwd = std::filesystem::current_path();
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, cwd);
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, cwd.parent_path());
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, cwd.parent_path().parent_path());
+    } catch (...) {
+    }
+
+    std::wstring userProfile;
+    if (TryReadEnvironmentVariable(L"USERPROFILE", userProfile)) {
+        const std::filesystem::path userRoot(userProfile);
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, userRoot / L".minecraft");
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, userRoot / L"AppData" / L"Roaming" / L".minecraft");
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, userRoot / L"Desktop" / L"msr" / L"MultiMC");
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, userRoot / L"Desktop" / L"msr");
+    }
+
+    std::wstring appData;
+    if (TryReadEnvironmentVariable(L"APPDATA", appData)) {
+        const std::filesystem::path appDataRoot(appData);
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, appDataRoot / L".minecraft");
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, appDataRoot / L"PrismLauncher");
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, appDataRoot / L"MultiMC");
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, appDataRoot / L"PolyMC");
+    }
+
+    std::wstring localAppData;
+    if (TryReadEnvironmentVariable(L"LOCALAPPDATA", localAppData)) {
+        const std::filesystem::path localAppDataRoot(localAppData);
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, localAppDataRoot / L"PrismLauncher");
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, localAppDataRoot / L"MultiMC");
+        AddCommonMinecraftAccountCandidates(candidates, seenCandidates, localAppDataRoot / L"PolyMC");
+    }
+
+    std::string newestUsername;
+    std::string newestUuid;
+    std::filesystem::file_time_type newestWrite{};
+    bool found = false;
+    for (const std::filesystem::path& candidate : candidates) {
+        std::error_code ec;
+        if (!std::filesystem::exists(candidate, ec) || ec) continue;
+        if (!std::filesystem::is_regular_file(candidate, ec) || ec) continue;
+
+        std::string json;
+        if (!TryReadSmallTextFile(candidate, json)) continue;
+
+        std::string parsedName;
+        std::string parsedUuid;
+        if (!TryExtractMinecraftIdentityFromAccountJson(json, parsedName, parsedUuid)) continue;
+
+        const auto writeTime = std::filesystem::last_write_time(candidate, ec);
+        if (!found || (!ec && writeTime > newestWrite)) {
+            found = true;
+            newestWrite = writeTime;
+            newestUsername = parsedName;
+            newestUuid = parsedUuid;
+        }
+    }
+
+    if (!found) return false;
+    if (!newestUsername.empty()) outUsername = newestUsername;
+    if (!newestUuid.empty()) outUuid = newestUuid;
+    return !outUsername.empty() || !outUuid.empty();
+}
+
+static bool TryResolveMcsrAutoDetectedIdentity(std::string& outUsername, std::string& outUuid) {
+    outUsername.clear();
+    outUuid.clear();
+
+    if (TryResolveMinecraftIdentityFromCommandLine(outUsername, outUuid)) return true;
+
+    // Account files are preferred because they identify the currently signed-in profile
+    // even before/without log lines.
+    if (TryResolveMinecraftIdentityFromAccountFiles(outUsername, outUuid)) return true;
+
+    std::filesystem::path latestLogPath;
+    if (!TryResolveMinecraftLatestLogPath(latestLogPath)) return false;
+
+    const ULONGLONG nowMs = GetTickCount64();
+    if (!s_mcsrAutoPlayerCacheState.latestLogPath.empty() && s_mcsrAutoPlayerCacheState.latestLogPath == latestLogPath &&
+        nowMs < s_mcsrAutoPlayerCacheState.nextRefreshMs && !s_mcsrAutoPlayerCacheState.username.empty()) {
+        outUsername = s_mcsrAutoPlayerCacheState.username;
+        return true;
+    }
+
+    std::error_code ec;
+    const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(latestLogPath, ec);
+    if (!ec && !s_mcsrAutoPlayerCacheState.latestLogPath.empty() && s_mcsrAutoPlayerCacheState.latestLogPath == latestLogPath &&
+        s_mcsrAutoPlayerCacheState.hasLatestWriteTime && s_mcsrAutoPlayerCacheState.latestWriteTime == writeTime &&
+        !s_mcsrAutoPlayerCacheState.username.empty()) {
+        s_mcsrAutoPlayerCacheState.nextRefreshMs = nowMs + 2000;
+        outUsername = s_mcsrAutoPlayerCacheState.username;
+        return true;
+    }
+
+    std::string parsedUsername;
+    if (!TryExtractMinecraftUsernameFromLog(latestLogPath, parsedUsername)) {
+        s_mcsrAutoPlayerCacheState.latestLogPath = latestLogPath;
+        if (!ec) {
+            s_mcsrAutoPlayerCacheState.latestWriteTime = writeTime;
+            s_mcsrAutoPlayerCacheState.hasLatestWriteTime = true;
+        } else {
+            s_mcsrAutoPlayerCacheState.hasLatestWriteTime = false;
+        }
+        s_mcsrAutoPlayerCacheState.nextRefreshMs = nowMs + 3000;
+        return false;
+    }
+
+    s_mcsrAutoPlayerCacheState.latestLogPath = latestLogPath;
+    if (!ec) {
+        s_mcsrAutoPlayerCacheState.latestWriteTime = writeTime;
+        s_mcsrAutoPlayerCacheState.hasLatestWriteTime = true;
+    } else {
+        s_mcsrAutoPlayerCacheState.hasLatestWriteTime = false;
+    }
+    s_mcsrAutoPlayerCacheState.username = parsedUsername;
+    s_mcsrAutoPlayerCacheState.nextRefreshMs = nowMs + 2000;
+    outUsername = parsedUsername;
+    return true;
+}
+
 static bool TryResolveMouseSensitivityFromOptionsTxt(double& outSensitivity) {
     outSensitivity = 0.0;
+
+    std::filesystem::path activeOptionsPath;
+    std::filesystem::path activeStandardSettingsPath;
+    if (TryResolveActiveMinecraftConfigPathsForStronghold(activeOptionsPath, activeStandardSettingsPath)) {
+        double parsed = 0.0;
+        if (!activeOptionsPath.empty() && TryReadMouseSensitivityFromOptionsFile(activeOptionsPath, parsed)) {
+            outSensitivity = parsed;
+            return true;
+        }
+    }
 
     // Instance-local resolution first. This keeps sensitivity lookup deterministic
     // for per-instance installs where options.txt lives in <instance>/.minecraft.
@@ -1302,18 +2093,53 @@ static bool TryResolveMouseSensitivityFromOptionsTxt(double& outSensitivity) {
     return true;
 }
 
+static bool TryResolveMouseSensitivityFromStandardSettingsJson(double& outSensitivity) {
+    outSensitivity = 0.0;
+
+    std::filesystem::path activeOptionsPath;
+    std::filesystem::path activeStandardSettingsPath;
+    if (TryResolveActiveMinecraftConfigPathsForStronghold(activeOptionsPath, activeStandardSettingsPath)) {
+        double parsed = 0.0;
+        if (!activeStandardSettingsPath.empty() && TryReadMouseSensitivityFromStandardSettingsFile(activeStandardSettingsPath, parsed)) {
+            outSensitivity = parsed;
+            return true;
+        }
+    }
+    return false;
+}
+
 static NbbBoatAngleSettings GetResolvedNbbBoatAngleSettings() {
     const ULONGLONG now = GetTickCount64();
-    if (s_cachedNbbBoatAngleSettingsInitialized && now - s_cachedNbbBoatAngleSettingsRefreshMs <= kNbbPrefsRefreshIntervalMs) {
+    if (s_cachedNbbBoatAngleSettingsInitialized &&
+        now - s_cachedNbbBoatAngleSettingsRefreshMs <= kNbbBoatAngleSettingsRefreshIntervalMs) {
         return s_cachedNbbBoatAngleSettings;
     }
 
     NbbBoatAngleSettings resolved;
 
+    bool sensitivityResolved = false;
     double sensitivity = 0.0;
-    if (TryReadRegistryDouble(HKEY_CURRENT_USER, kNbbPrefsRegistrySubkey, kNbbSensitivityRegistryValue, sensitivity) ||
-        TryResolveMouseSensitivityFromOptionsTxt(sensitivity)) {
+    if (TryResolveMouseSensitivityFromStandardSettingsJson(sensitivity) || TryResolveMouseSensitivityFromOptionsTxt(sensitivity)) {
         resolved.sensitivityAutomatic = std::clamp(sensitivity, 0.0, 1.0);
+        sensitivityResolved = true;
+    }
+
+    if (!sensitivityResolved) {
+        if (TryReadRegistryDouble(HKEY_CURRENT_USER, kNbbPrefsRegistrySubkey, kNbbSensitivityRegistryValue, sensitivity)) {
+            resolved.sensitivityAutomatic = std::clamp(sensitivity, 0.0, 1.0);
+            sensitivityResolved = true;
+        }
+    }
+
+    if (!sensitivityResolved) {
+        if (auto cfgSnap = GetConfigSnapshot(); cfgSnap) {
+            const double appliedSensitivity = static_cast<double>(cfgSnap->boatSetup.appliedRecommendedSensitivity);
+            if (cfgSnap->boatSetup.enabled && std::isfinite(appliedSensitivity) && appliedSensitivity >= 0.0 &&
+                appliedSensitivity <= 1.0) {
+                resolved.sensitivityAutomatic = std::clamp(appliedSensitivity, 0.0, 1.0);
+                sensitivityResolved = true;
+            }
+        }
     }
 
     double crosshairCorrection = 0.0;
@@ -1578,14 +2404,32 @@ static bool TryResolveBoatInitAngle(double rawAngleDeg, float& outBoatAngleDeg) 
     if (!std::isfinite(rawAngleDeg)) return false;
     if (std::abs(rawAngleDeg) > 360.0) return false;
 
-    // Keep NBB's existing measurement behavior for first boat setup validation.
-    const double increment = (rawAngleDeg >= 0.0) ? kBoatInitPositiveIncrementDeg : kBoatInitNegativeIncrementDeg;
-    const float candidate = static_cast<float>(std::round(rawAngleDeg / increment) * increment);
+    // Boat yaw is valid only on the 360/256 grid (1.40625). Captures taken during
+    // the initial settle phase (0.140625 grid) should fail this check.
+    const float candidate = static_cast<float>(std::round(rawAngleDeg / kBoatInitIncrementDeg) * kBoatInitIncrementDeg);
     const double roundedCandidate = std::round(static_cast<double>(candidate) * 100.0) / 100.0;
     if (std::abs(roundedCandidate - rawAngleDeg) > kBoatInitErrorLimitDeg) return false;
 
     outBoatAngleDeg = candidate;
     return true;
+}
+
+static bool IsBoatEyeSensitivityEligible(double sensitivity) {
+    if (!std::isfinite(sensitivity)) return false;
+    const double minIncrement = MinecraftYawDegreesPerMouseCount(std::clamp(sensitivity, 0.0, 1.0));
+    if (!std::isfinite(minIncrement)) return false;
+    // Boat-eye decimal inference requires minimum increment > 0.01 deg.
+    return minIncrement > 0.01;
+}
+
+static bool IsLikelyMod360Discontinuity(double previousRawYawDeg, double currentRawYawDeg) {
+    if (!std::isfinite(previousRawYawDeg) || !std::isfinite(currentRawYawDeg)) return false;
+    // The copied F3+C yaw is "total yaw"; portal/relog/pearl can mod it back
+    // into [-360, 360], creating a hard discontinuity for boat-eye inference.
+    const bool wasOutsideWrapRange = std::abs(previousRawYawDeg) > 360.0;
+    const bool nowInsideWrapRange = std::abs(currentRawYawDeg) <= 360.0;
+    if (!wasOutsideWrapRange || !nowInsideWrapRange) return false;
+    return std::abs(currentRawYawDeg - previousRawYawDeg) >= 180.0;
 }
 
 static double ApplyNbbCorrectedHorizontalAngle(double angleDeg, double crosshairCorrectionDeg) {
@@ -2751,8 +3595,12 @@ static void ApplyPlayerPoseAndTargetToOverlayState(StrongholdOverlayRuntimeState
     state.distanceDisplay = static_cast<float>(distance);
 }
 
-static bool HttpGetJson(const wchar_t* requestPath, std::string& outJson) {
+static bool HttpGetJson(const wchar_t* host, INTERNET_PORT port, const wchar_t* requestPath, DWORD timeoutMs, bool useTls,
+                        std::string& outJson, DWORD* outStatusCode = nullptr, DWORD* outLastError = nullptr,
+                        const wchar_t* extraHeaders = nullptr) {
     outJson.clear();
+    if (outStatusCode) *outStatusCode = 0;
+    if (outLastError) *outLastError = 0;
     if (!s_winHttpApi.EnsureLoaded()) return false;
 
     HINTERNET hSession = nullptr;
@@ -2763,34 +3611,59 @@ static bool HttpGetJson(const wchar_t* requestPath, std::string& outJson) {
     do {
         hSession =
             s_winHttpApi.open(L"Toolscreen/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!hSession) break;
-
-        s_winHttpApi.setTimeouts(hSession, kStrongholdApiTimeoutMs, kStrongholdApiTimeoutMs, kStrongholdApiTimeoutMs, kStrongholdApiTimeoutMs);
-
-        hConnect = s_winHttpApi.connect(hSession, kStrongholdApiHost, kStrongholdApiPort, 0);
-        if (!hConnect) break;
-
-        hRequest =
-            s_winHttpApi.openRequest(hConnect, L"GET", requestPath, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-        if (!hRequest) break;
-
-        if (!s_winHttpApi.sendRequest(hRequest, L"Accept: application/json\r\n", static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        if (!hSession) {
+            if (outLastError) *outLastError = GetLastError();
             break;
         }
-        if (!s_winHttpApi.receiveResponse(hRequest, nullptr)) break;
+
+        s_winHttpApi.setTimeouts(hSession, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
+
+        hConnect = s_winHttpApi.connect(hSession, host, port, 0);
+        if (!hConnect) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+
+        const DWORD requestFlags = useTls ? WINHTTP_FLAG_SECURE : 0;
+        hRequest = s_winHttpApi.openRequest(hConnect, L"GET", requestPath, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                            requestFlags);
+        if (!hRequest) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+
+        std::wstring headerBlob = L"Accept: application/json\r\n";
+        if (extraHeaders && extraHeaders[0] != L'\0') {
+            headerBlob += extraHeaders;
+            if (headerBlob.size() < 2 || headerBlob.substr(headerBlob.size() - 2) != L"\r\n") { headerBlob += L"\r\n"; }
+        }
+
+        if (!s_winHttpApi.sendRequest(hRequest, headerBlob.c_str(), static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+        if (!s_winHttpApi.receiveResponse(hRequest, nullptr)) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
 
         DWORD statusCode = 0;
         DWORD statusCodeSize = sizeof(statusCode);
         if (!s_winHttpApi.queryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
                                        &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX)) {
+            if (outLastError) *outLastError = GetLastError();
             break;
         }
+        if (outStatusCode) *outStatusCode = statusCode;
         if (statusCode != 200) break;
 
         std::string response;
         while (true) {
             DWORD bytesAvailable = 0;
-            if (!s_winHttpApi.queryDataAvailable(hRequest, &bytesAvailable)) break;
+            if (!s_winHttpApi.queryDataAvailable(hRequest, &bytesAvailable)) {
+                if (outLastError) *outLastError = GetLastError();
+                break;
+            }
             if (bytesAvailable == 0) {
                 outJson = std::move(response);
                 success = !outJson.empty();
@@ -2799,7 +3672,10 @@ static bool HttpGetJson(const wchar_t* requestPath, std::string& outJson) {
 
             std::vector<char> buffer(bytesAvailable);
             DWORD bytesRead = 0;
-            if (!s_winHttpApi.readData(hRequest, buffer.data(), bytesAvailable, &bytesRead)) break;
+            if (!s_winHttpApi.readData(hRequest, buffer.data(), bytesAvailable, &bytesRead)) {
+                if (outLastError) *outLastError = GetLastError();
+                break;
+            }
             if (bytesRead == 0) break;
             response.append(buffer.data(), bytesRead);
         }
@@ -2812,11 +3688,178 @@ static bool HttpGetJson(const wchar_t* requestPath, std::string& outJson) {
 }
 
 static bool HttpGetStrongholdJson(std::string& outJson) {
-    return HttpGetJson(kStrongholdApiPath, outJson);
+    return HttpGetJson(kStrongholdApiHost, kStrongholdApiPort, kStrongholdApiPath, kStrongholdApiTimeoutMs, false, outJson);
 }
 
 static bool HttpGetInformationMessagesJson(std::string& outJson) {
-    return HttpGetJson(kInformationMessagesApiPath, outJson);
+    return HttpGetJson(kStrongholdApiHost, kStrongholdApiPort, kInformationMessagesApiPath, kStrongholdApiTimeoutMs, false, outJson);
+}
+
+static bool HttpGetBinary(const wchar_t* host, INTERNET_PORT port, const wchar_t* requestPath, DWORD timeoutMs, bool useTls,
+                          std::vector<unsigned char>& outBytes, DWORD* outStatusCode = nullptr, DWORD* outLastError = nullptr,
+                          const wchar_t* extraHeaders = nullptr) {
+    outBytes.clear();
+    if (outStatusCode) *outStatusCode = 0;
+    if (outLastError) *outLastError = 0;
+    if (!s_winHttpApi.EnsureLoaded()) return false;
+
+    HINTERNET hSession = nullptr;
+    HINTERNET hConnect = nullptr;
+    HINTERNET hRequest = nullptr;
+    bool success = false;
+
+    do {
+        hSession =
+            s_winHttpApi.open(L"Toolscreen/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+        s_winHttpApi.setTimeouts(hSession, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
+
+        hConnect = s_winHttpApi.connect(hSession, host, port, 0);
+        if (!hConnect) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+
+        const DWORD requestFlags = useTls ? WINHTTP_FLAG_SECURE : 0;
+        hRequest = s_winHttpApi.openRequest(hConnect, L"GET", requestPath, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                            requestFlags);
+        if (!hRequest) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+
+        std::wstring headerBlob = L"Accept: image/png,image/*,*/*\r\n";
+        if (extraHeaders && extraHeaders[0] != L'\0') {
+            headerBlob += extraHeaders;
+            if (headerBlob.size() < 2 || headerBlob.substr(headerBlob.size() - 2) != L"\r\n") { headerBlob += L"\r\n"; }
+        }
+
+        if (!s_winHttpApi.sendRequest(hRequest, headerBlob.c_str(), static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+        if (!s_winHttpApi.receiveResponse(hRequest, nullptr)) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+
+        DWORD statusCode = 0;
+        DWORD statusCodeSize = sizeof(statusCode);
+        if (!s_winHttpApi.queryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                                       &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX)) {
+            if (outLastError) *outLastError = GetLastError();
+            break;
+        }
+        if (outStatusCode) *outStatusCode = statusCode;
+        if (statusCode != 200) break;
+
+        std::vector<unsigned char> response;
+        while (true) {
+            DWORD bytesAvailable = 0;
+            if (!s_winHttpApi.queryDataAvailable(hRequest, &bytesAvailable)) {
+                if (outLastError) *outLastError = GetLastError();
+                break;
+            }
+            if (bytesAvailable == 0) {
+                outBytes = std::move(response);
+                success = !outBytes.empty();
+                break;
+            }
+            const size_t offset = response.size();
+            response.resize(offset + static_cast<size_t>(bytesAvailable));
+            DWORD bytesRead = 0;
+            if (!s_winHttpApi.readData(hRequest, response.data() + offset, bytesAvailable, &bytesRead)) {
+                if (outLastError) *outLastError = GetLastError();
+                break;
+            }
+            if (bytesRead == 0) break;
+            response.resize(offset + static_cast<size_t>(bytesRead));
+        }
+    } while (false);
+
+    if (hRequest) s_winHttpApi.closeHandle(hRequest);
+    if (hConnect) s_winHttpApi.closeHandle(hConnect);
+    if (hSession) s_winHttpApi.closeHandle(hSession);
+    return success;
+}
+
+static bool HttpGetMcsrJson(const std::wstring& requestPath, std::string& outJson, DWORD* outStatusCode = nullptr,
+                            DWORD* outLastError = nullptr, const std::wstring& extraHeaders = L"") {
+    if (requestPath.empty()) return false;
+    const std::wstring cacheAuthHeaders = BuildMcsrCacheServerAuthHeaders();
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= s_mcsrCacheServerRetryAt) {
+        const McsrCacheServerEndpoint cacheEndpoint = ResolveMcsrCacheServerEndpoint();
+        if (cacheEndpoint.enabled && !cacheEndpoint.host.empty() && cacheEndpoint.port > 0) {
+            DWORD cacheStatus = 0;
+            DWORD cacheError = 0;
+            const std::wstring cacheRequestPath = BuildMcsrCacheServerRequestPath(cacheEndpoint.basePath, requestPath);
+            std::wstring cacheRequestHeaders = extraHeaders;
+            if (!cacheAuthHeaders.empty()) cacheRequestHeaders += cacheAuthHeaders;
+            const bool cacheOk = HttpGetJson(cacheEndpoint.host.c_str(), cacheEndpoint.port, cacheRequestPath.c_str(),
+                                             kMcsrApiCacheTimeoutMs, cacheEndpoint.useTls, outJson, &cacheStatus, &cacheError,
+                                             cacheRequestHeaders.empty() ? nullptr : cacheRequestHeaders.c_str());
+            if (cacheOk) {
+                s_mcsrCacheServerRetryAt = std::chrono::steady_clock::time_point::min();
+                if (outStatusCode) *outStatusCode = 200;
+                if (outLastError) *outLastError = 0;
+                return true;
+            }
+
+            const bool cacheNetworkError = (cacheStatus == 0 && cacheError != 0);
+            if (cacheNetworkError) {
+                s_mcsrCacheServerRetryAt = now + std::chrono::seconds(15);
+            } else {
+                // Service is reachable but returned an API status (e.g. 404/429).
+                // Retry soon so fresh cache is used as soon as it is valid again.
+                s_mcsrCacheServerRetryAt = now + std::chrono::seconds(2);
+            }
+        }
+    }
+
+    auto requestOnHost = [&](const wchar_t* host, DWORD* statusCodeOut, DWORD* lastErrorOut) -> bool {
+        return HttpGetJson(host, kMcsrApiPort, requestPath.c_str(), kMcsrApiTimeoutMs, true, outJson, statusCodeOut, lastErrorOut,
+                           extraHeaders.empty() ? nullptr : extraHeaders.c_str());
+    };
+
+    DWORD statusA = 0;
+    DWORD errorA = 0;
+    DWORD statusB = 0;
+    DWORD errorB = 0;
+    const bool preferFallback = s_mcsrPreferFallbackHost.load(std::memory_order_relaxed);
+
+    const wchar_t* firstHost = preferFallback ? kMcsrApiFallbackHost : kMcsrApiHost;
+    const wchar_t* secondHost = preferFallback ? kMcsrApiHost : kMcsrApiFallbackHost;
+
+    if (requestOnHost(firstHost, &statusA, &errorA)) {
+        s_mcsrPreferFallbackHost.store(firstHost == kMcsrApiFallbackHost, std::memory_order_relaxed);
+        if (outStatusCode) *outStatusCode = 200;
+        if (outLastError) *outLastError = 0;
+        return true;
+    }
+
+    const bool firstNotFoundLike = (statusA == 400 || statusA == 404);
+    const bool firstNetworkLike = (statusA == 0 && errorA != 0);
+    if (firstNotFoundLike || firstNetworkLike) {
+        if (requestOnHost(secondHost, &statusB, &errorB)) {
+            s_mcsrPreferFallbackHost.store(secondHost == kMcsrApiFallbackHost, std::memory_order_relaxed);
+            if (outStatusCode) *outStatusCode = 200;
+            if (outLastError) *outLastError = 0;
+            return true;
+        }
+
+        if (outStatusCode) *outStatusCode = (statusB != 0) ? statusB : statusA;
+        if (outLastError) *outLastError = (errorB != 0) ? errorB : errorA;
+        return false;
+    }
+
+    if (outStatusCode) *outStatusCode = statusA;
+    if (outLastError) *outLastError = errorA;
+    return false;
 }
 
 static std::string JsonUnescapeBasic(const std::string& in) {
@@ -2908,6 +3951,25 @@ static void PollStandaloneClipboardState(bool allowNonBoatThrows) {
 
     const bool isOverworldSnapshot = parsed.dimension == ClipboardDimension::Overworld;
     const bool isNetherSnapshot = parsed.dimension == ClipboardDimension::Nether;
+    const bool mod360Discontinuity =
+        !allowNonBoatThrows && isOverworldSnapshot && s_standaloneStrongholdState.hasBoatAngle &&
+        s_standaloneStrongholdState.hasLastOverworldRawYaw &&
+        IsLikelyMod360Discontinuity(s_standaloneStrongholdState.lastOverworldRawYaw, parsed.horizontalAngle);
+    if (isOverworldSnapshot) {
+        s_standaloneStrongholdState.hasLastOverworldRawYaw = true;
+        s_standaloneStrongholdState.lastOverworldRawYaw = parsed.horizontalAngle;
+    }
+
+    if (mod360Discontinuity) {
+        // Mod-360 events (portal/relog/pearl) break boat-eye continuity.
+        // Force re-init and discard stale throws.
+        s_standaloneStrongholdState.boatState = kBoatStateFailed;
+        s_standaloneStrongholdState.hasBoatAngle = false;
+        s_standaloneStrongholdState.boatAngleDeg = 0.0;
+        s_standaloneStrongholdState.eyeThrows.clear();
+        return;
+    }
+
     const double dimensionScale = isNetherSnapshot ? 8.0 : 1.0;
     s_standaloneStrongholdState.hasPlayerSnapshot = true;
     s_standaloneStrongholdState.playerXInOverworld = parsed.x * dimensionScale;
@@ -2928,6 +3990,7 @@ static void PollStandaloneClipboardState(bool allowNonBoatThrows) {
                 s_standaloneStrongholdState.boatState = kBoatStateGood;
                 s_standaloneStrongholdState.hasBoatAngle = true;
                 s_standaloneStrongholdState.boatAngleDeg = resolvedBoatAngleDeg;
+                s_standaloneStrongholdState.eyeThrows.clear();
             } else {
                 s_standaloneStrongholdState.boatState = kBoatStateFailed;
                 s_standaloneStrongholdState.hasBoatAngle = false;
@@ -2940,6 +4003,8 @@ static void PollStandaloneClipboardState(bool allowNonBoatThrows) {
         s_standaloneStrongholdState.boatState = kBoatStateUninitialized;
         s_standaloneStrongholdState.hasBoatAngle = false;
         s_standaloneStrongholdState.boatAngleDeg = 0.0;
+        s_standaloneStrongholdState.hasLastOverworldRawYaw = false;
+        s_standaloneStrongholdState.lastOverworldRawYaw = 0.0;
     }
 
     // Boat-eye throw logging is overworld-only. Nether snapshots may still
@@ -2961,6 +4026,12 @@ static void PollStandaloneClipboardState(bool allowNonBoatThrows) {
         newThrow.type = EyeThrowType::Normal;
     } else if (s_standaloneStrongholdState.hasBoatAngle) {
         const NbbBoatAngleSettings settings = GetResolvedNbbBoatAngleSettings();
+        if (!IsBoatEyeSensitivityEligible(settings.sensitivityAutomatic)) {
+            s_standaloneStrongholdState.boatState = kBoatStateFailed;
+            s_standaloneStrongholdState.hasBoatAngle = false;
+            s_standaloneStrongholdState.boatAngleDeg = 0.0;
+            return;
+        }
         throwAngleDeg = ComputeNbbPreciseBoatHorizontalAngle(parsed.horizontalAngle, settings.sensitivityAutomatic,
                                                              settings.crosshairCorrectionDeg, s_standaloneStrongholdState.boatAngleDeg);
         newThrow.type = EyeThrowType::Boat;
@@ -3123,6 +4194,1881 @@ static ParsedInformationMessagesData ParseInformationMessagesPayload(const std::
 
     data.ok = true;
     return data;
+}
+
+static std::string UrlEncodePathSegment(const std::string& text) {
+    std::ostringstream out;
+    out << std::uppercase << std::hex;
+    for (unsigned char c : text) {
+        const bool isAlpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool isDigit = (c >= '0' && c <= '9');
+        const bool isSafe = (c == '-') || (c == '_') || (c == '.') || (c == '~');
+        if (isAlpha || isDigit || isSafe) {
+            out << static_cast<char>(c);
+        } else {
+            out << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+        }
+    }
+    return out.str();
+}
+
+static std::string ToLowerAsciiCopy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static bool EqualsIgnoreCaseAscii(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    }
+    return true;
+}
+
+static bool ContainsIgnoreCaseAscii(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    return ToLowerAsciiCopy(haystack).find(ToLowerAsciiCopy(needle)) != std::string::npos;
+}
+
+static void PushUniqueCaseInsensitive(std::vector<std::string>& values, const std::string& value, size_t maxCount) {
+    std::string trimmed = value;
+    TrimAsciiWhitespaceInPlace(trimmed);
+    if (trimmed.empty()) return;
+    for (const std::string& existing : values) {
+        if (EqualsIgnoreCaseAscii(existing, trimmed)) return;
+    }
+    values.push_back(std::move(trimmed));
+    if (values.size() > maxCount) values.resize(maxCount);
+}
+
+static std::string FormatDurationMs(int durationMs) {
+    if (durationMs <= 0) return "--:--.--";
+    const int totalSeconds = durationMs / 1000;
+    const int minutes = totalSeconds / 60;
+    const int seconds = totalSeconds % 60;
+    const int centiseconds = (durationMs % 1000) / 10;
+    std::ostringstream out;
+    out << std::setfill('0') << std::setw(2) << minutes << ":" << std::setw(2) << seconds << "." << std::setw(2)
+        << centiseconds;
+    return out.str();
+}
+
+static std::string FormatAgeShortFromEpoch(int epochSeconds) {
+    if (epochSeconds <= 0) return "--";
+    const std::time_t now = std::time(nullptr);
+    if (now <= 0) return "--";
+    int delta = static_cast<int>(now - static_cast<std::time_t>(epochSeconds));
+    if (delta < 0) delta = 0;
+    if (delta < 60) return std::to_string(delta) + "s";
+    if (delta < 3600) return std::to_string(delta / 60) + "m";
+    if (delta < 86400) return std::to_string(delta / 3600) + "h";
+    return std::to_string(delta / 86400) + "d";
+}
+
+enum class McsrMatchCategoryType : int {
+    Ranked = 0,
+    Private = 1,
+    Casual = 2,
+    Event = 3,
+    Other = 4,
+};
+
+static bool TryClassifyMcsrMatchCategoryFromType(int type, McsrMatchCategoryType& outCategory) {
+    switch (type) {
+    case kMcsrMatchTypeRanked:
+        outCategory = McsrMatchCategoryType::Ranked;
+        return true;
+    case kMcsrMatchTypePrivate:
+        outCategory = McsrMatchCategoryType::Private;
+        return true;
+    case kMcsrMatchTypeCasual:
+        outCategory = McsrMatchCategoryType::Casual;
+        return true;
+    case kMcsrMatchTypeEvent:
+        outCategory = McsrMatchCategoryType::Event;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static McsrMatchCategoryType ClassifyMcsrMatchCategory(const ParsedMcsrMatchSummary& match) {
+    const std::string modeLower = ToLowerAsciiCopy(match.gameMode);
+    const std::string categoryLower = ToLowerAsciiCopy(match.category);
+    if (ContainsIgnoreCaseAscii(modeLower, "private") || ContainsIgnoreCaseAscii(categoryLower, "private")) {
+        return McsrMatchCategoryType::Private;
+    }
+    if (ContainsIgnoreCaseAscii(modeLower, "casual") || ContainsIgnoreCaseAscii(categoryLower, "casual")) {
+        return McsrMatchCategoryType::Casual;
+    }
+    if (ContainsIgnoreCaseAscii(modeLower, "event") || ContainsIgnoreCaseAscii(categoryLower, "event") ||
+        ContainsIgnoreCaseAscii(categoryLower, "tournament") || ContainsIgnoreCaseAscii(categoryLower, "weekly")) {
+        return McsrMatchCategoryType::Event;
+    }
+    if (ContainsIgnoreCaseAscii(modeLower, "ranked") || ContainsIgnoreCaseAscii(categoryLower, "ranked")) {
+        return McsrMatchCategoryType::Ranked;
+    }
+    McsrMatchCategoryType fromType = McsrMatchCategoryType::Other;
+    if (TryClassifyMcsrMatchCategoryFromType(match.type, fromType)) return fromType;
+    return McsrMatchCategoryType::Other;
+}
+
+static bool IsMcsrRankedMatch(const ParsedMcsrMatchSummary& match) {
+    return ClassifyMcsrMatchCategory(match) == McsrMatchCategoryType::Ranked;
+}
+
+static std::string McsrTimelineTypeLabel(int type) {
+    switch (type) {
+    case 2:
+        return "Portal";
+    case 7:
+        return "Bastion";
+    case 11:
+        return "Fortress";
+    case 12:
+        return "Travel";
+    case 15:
+        return "Finish";
+    default:
+        return "Split " + std::to_string(type);
+    }
+}
+
+static std::filesystem::path GetMcsrUsernameIndexPath() {
+    if (!g_toolscreenPath.empty()) { return std::filesystem::path(g_toolscreenPath) / L"mcsr_username_index.txt"; }
+    return std::filesystem::path(L"mcsr_username_index.txt");
+}
+
+static std::filesystem::path GetMcsrUsernameIndexMetaPath() {
+    if (!g_toolscreenPath.empty()) { return std::filesystem::path(g_toolscreenPath) / L"mcsr_username_index.meta"; }
+    return std::filesystem::path(L"mcsr_username_index.meta");
+}
+
+static bool TryReadEpochSecondsFile(const std::filesystem::path& path, std::time_t& outEpochSeconds) {
+    outEpochSeconds = 0;
+    std::ifstream in(path);
+    if (!in.is_open()) return false;
+    std::string line;
+    if (!std::getline(in, line)) return false;
+    TrimAsciiWhitespaceInPlace(line);
+    if (line.empty()) return false;
+    try {
+        const long long parsed = std::stoll(line);
+        if (parsed <= 0) return false;
+        outEpochSeconds = static_cast<std::time_t>(parsed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static void WriteEpochSecondsFile(const std::filesystem::path& path, std::time_t epochSeconds) {
+    if (epochSeconds <= 0) return;
+    std::error_code ec;
+    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) return;
+    out << static_cast<long long>(epochSeconds) << "\n";
+}
+
+static void LoadMcsrUsernameIndexFromDiskIfNeeded() {
+    if (s_mcsrUsernameIndexLoaded) return;
+    s_mcsrUsernameIndexLoaded = true;
+
+    s_mcsrLeaderboardSuggestions.clear();
+    std::ifstream in(GetMcsrUsernameIndexPath());
+    if (in.is_open()) {
+        std::string line;
+        while (std::getline(in, line)) {
+            TrimAsciiWhitespaceInPlace(line);
+            if (!IsValidMinecraftUsername(line)) continue;
+            PushUniqueCaseInsensitive(s_mcsrLeaderboardSuggestions, line, kMcsrUsernameIndexMaxNames);
+            if (s_mcsrLeaderboardSuggestions.size() >= kMcsrUsernameIndexMaxNames) break;
+        }
+    }
+
+    const auto nowSteady = std::chrono::steady_clock::now();
+    const std::time_t nowEpoch = std::time(nullptr);
+    if (nowEpoch <= 0) {
+        s_mcsrUsernameIndexNextRefresh = nowSteady;
+        return;
+    }
+
+    std::time_t lastSyncEpoch = 0;
+    if (!TryReadEpochSecondsFile(GetMcsrUsernameIndexMetaPath(), lastSyncEpoch) || lastSyncEpoch > nowEpoch) {
+        s_mcsrUsernameIndexNextRefresh = nowSteady;
+        return;
+    }
+
+    const long long elapsedSeconds = static_cast<long long>(nowEpoch - lastSyncEpoch);
+    if (elapsedSeconds < kMcsrUsernameIndexWeeklyRefreshSeconds) {
+        const int remainingSeconds = static_cast<int>(kMcsrUsernameIndexWeeklyRefreshSeconds - elapsedSeconds);
+        s_mcsrUsernameIndexNextRefresh = nowSteady + std::chrono::seconds(remainingSeconds);
+    } else {
+        s_mcsrUsernameIndexNextRefresh = nowSteady;
+    }
+}
+
+static bool SaveMcsrUsernameIndexToDisk(const std::vector<std::string>& names) {
+    const std::filesystem::path indexPath = GetMcsrUsernameIndexPath();
+    std::error_code ec;
+    if (!indexPath.parent_path().empty()) std::filesystem::create_directories(indexPath.parent_path(), ec);
+
+    std::ofstream out(indexPath, std::ios::trunc);
+    if (!out.is_open()) return false;
+    for (const std::string& name : names) {
+        if (!IsValidMinecraftUsername(name)) continue;
+        out << name << "\n";
+    }
+    if (!out.good()) return false;
+
+    const std::time_t nowEpoch = std::time(nullptr);
+    WriteEpochSecondsFile(GetMcsrUsernameIndexMetaPath(), nowEpoch);
+    return true;
+}
+
+static void MergeMcsrGlobalSuggestions(std::vector<std::string>& out, size_t maxCount) {
+    for (const std::string& globalName : s_mcsrLeaderboardSuggestions) {
+        PushUniqueCaseInsensitive(out, globalName, maxCount);
+        if (out.size() >= maxCount) break;
+    }
+}
+
+static ParsedMcsrUserData ParseMcsrUserPayload(const std::string& json) {
+    static const std::regex reUuid("\"uuid\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reNickname("\"nickname\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reCountry("\"country\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reEloRank("\"eloRank\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reEloRate("\"eloRate\"\\s*:\\s*(-?\\d+)");
+    static const std::regex rePeakElo("\"(?:peakElo|eloPeak)\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reRankedCount("\"ranked\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reRankedCountFloat("\"ranked\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
+    static const std::regex reAllCountFloat("\"all\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
+    static const std::regex reValueCountFloat("\"value\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
+    static const std::regex reForfeitRate("\"(?:forfeitRate|forfeitRatePercent|ffRate)\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
+    static const std::regex reAverageTime("\"(?:averageTime|avgTime)\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reAchievementId("\"id\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reAchievementValue("\"value\"\\s*:\\s*(-?\\d+)");
+
+    ParsedMcsrUserData out;
+    std::string dataObject;
+    if (!ExtractJsonEnclosedAfterKey(json, "data", '{', '}', dataObject)) return out;
+
+    ExtractRegexString(dataObject, reUuid, out.uuid);
+    ExtractRegexString(dataObject, reNickname, out.nickname);
+    ExtractRegexString(dataObject, reCountry, out.country);
+    ExtractRegexInt(dataObject, reEloRank, out.eloRank);
+    ExtractRegexInt(dataObject, reEloRate, out.eloRate);
+    ExtractRegexInt(dataObject, rePeakElo, out.peakElo);
+
+    double selectedForfeitRatePercent = -1.0;
+    int selectedForfeitRatePriority = -1;
+    int selectedAverageTimeMs = -1;
+    int selectedAverageTimePriority = -1;
+    auto normalizeForfeitRatePercent = [](double raw) {
+        if (!std::isfinite(raw)) return -1.0;
+        if (raw >= 0.0 && raw <= 1.0) raw *= 100.0;
+        return std::clamp(raw, 0.0, 100.0);
+    };
+    auto considerForfeitRatePercent = [&](double raw, int priority) {
+        const double normalized = normalizeForfeitRatePercent(raw);
+        if (normalized < 0.0) return;
+        if (priority > selectedForfeitRatePriority) {
+            selectedForfeitRatePriority = priority;
+            selectedForfeitRatePercent = normalized;
+        }
+    };
+    auto considerAverageTimeMs = [&](int avgMs, int priority) {
+        if (avgMs <= 0) return;
+        if (priority > selectedAverageTimePriority) {
+            selectedAverageTimePriority = priority;
+            selectedAverageTimeMs = avgMs;
+        }
+    };
+    auto tryExtractForfeitRateFromObject = [&](const std::string& objectText, double& outRate) {
+        for (const char* rateKey : { "forfeitRate", "forfeitRatePercent", "ffRate" }) {
+            std::string rateObject;
+            if (!ExtractJsonEnclosedAfterKey(objectText, rateKey, '{', '}', rateObject)) continue;
+            if (ExtractRegexDouble(rateObject, reRankedCountFloat, outRate)) return true;
+            if (ExtractRegexDouble(rateObject, reAllCountFloat, outRate)) return true;
+            if (ExtractRegexDouble(rateObject, reValueCountFloat, outRate)) return true;
+        }
+        if (ExtractRegexDouble(objectText, reForfeitRate, outRate)) return true;
+        return false;
+    };
+    auto tryExtractAverageTimeFromObject = [&](const std::string& objectText, int& outAvgMs) {
+        for (const char* avgKey : { "averageTime", "avgTime" }) {
+            std::string avgObject;
+            if (!ExtractJsonEnclosedAfterKey(objectText, avgKey, '{', '}', avgObject)) continue;
+            int rankedInt = 0;
+            if (ExtractRegexInt(avgObject, reRankedCount, rankedInt)) {
+                outAvgMs = std::max(0, rankedInt);
+                return true;
+            }
+            double rankedFloat = 0.0;
+            if (ExtractRegexDouble(avgObject, reRankedCountFloat, rankedFloat)) {
+                outAvgMs = std::max(0, static_cast<int>(std::lround(rankedFloat)));
+                return true;
+            }
+            double allFloat = 0.0;
+            if (ExtractRegexDouble(avgObject, reAllCountFloat, allFloat)) {
+                outAvgMs = std::max(0, static_cast<int>(std::lround(allFloat)));
+                return true;
+            }
+            double valueFloat = 0.0;
+            if (ExtractRegexDouble(avgObject, reValueCountFloat, valueFloat)) {
+                outAvgMs = std::max(0, static_cast<int>(std::lround(valueFloat)));
+                return true;
+            }
+        }
+        if (ExtractRegexInt(objectText, reAverageTime, outAvgMs)) return true;
+        return false;
+    };
+    int topLevelAverageTime = 0;
+    if (tryExtractAverageTimeFromObject(dataObject, topLevelAverageTime)) {
+        considerAverageTimeMs(topLevelAverageTime, 220);
+    }
+
+    std::string statsObject;
+    if (ExtractJsonEnclosedAfterKey(dataObject, "statistics", '{', '}', statsObject)) {
+        auto extractRankedFrom = [&](const std::string& parentObject, const char* key, int& outValue) {
+            std::string nestedObject;
+            if (!ExtractJsonEnclosedAfterKey(parentObject, key, '{', '}', nestedObject)) return false;
+            return ExtractRegexInt(nestedObject, reRankedCount, outValue);
+        };
+
+        std::string seasonObject;
+        if (ExtractJsonEnclosedAfterKey(statsObject, "season", '{', '}', seasonObject)) {
+            extractRankedFrom(seasonObject, "wins", out.seasonWinsRanked);
+            if (!extractRankedFrom(seasonObject, "loses", out.seasonLossesRanked)) {
+                extractRankedFrom(seasonObject, "losses", out.seasonLossesRanked);
+            }
+            extractRankedFrom(seasonObject, "completions", out.seasonCompletionsRanked);
+            extractRankedFrom(seasonObject, "points", out.seasonPointsRanked);
+            extractRankedFrom(seasonObject, "ffs", out.seasonFfsRanked);
+            extractRankedFrom(seasonObject, "dodges", out.seasonDodgesRanked);
+            extractRankedFrom(seasonObject, "currentWinStreak", out.seasonCurrentWinStreakRanked);
+            int seasonAverageTime = 0;
+            if (tryExtractAverageTimeFromObject(seasonObject, seasonAverageTime)) {
+                considerAverageTimeMs(seasonAverageTime, 120);
+            }
+            double seasonForfeitRate = 0.0;
+            if (tryExtractForfeitRateFromObject(seasonObject, seasonForfeitRate)) {
+                considerForfeitRatePercent(seasonForfeitRate, 120);
+            }
+        }
+
+        std::string overallObject;
+        bool hasOverallStats = false;
+        for (const char* overallKey : { "all", "allTime", "overall", "global", "lifetime" }) {
+            if (ExtractJsonEnclosedAfterKey(statsObject, overallKey, '{', '}', overallObject)) {
+                hasOverallStats = true;
+                break;
+            }
+        }
+        if (hasOverallStats) {
+            extractRankedFrom(overallObject, "wins", out.allWinsRanked);
+            if (!extractRankedFrom(overallObject, "loses", out.allLossesRanked)) {
+                extractRankedFrom(overallObject, "losses", out.allLossesRanked);
+            }
+            extractRankedFrom(overallObject, "ffs", out.allFfsRanked);
+            int overallAverageTime = 0;
+            if (tryExtractAverageTimeFromObject(overallObject, overallAverageTime)) {
+                considerAverageTimeMs(overallAverageTime, 320);
+            }
+            double overallForfeitRate = 0.0;
+            if (tryExtractForfeitRateFromObject(overallObject, overallForfeitRate)) {
+                considerForfeitRatePercent(overallForfeitRate, 300);
+            }
+            const int totalAllGames = std::max(0, out.allWinsRanked + out.allLossesRanked);
+            if (totalAllGames > 0) {
+                const double computedAllRate =
+                    (100.0 * static_cast<double>(std::max(0, out.allFfsRanked))) / static_cast<double>(totalAllGames);
+                considerForfeitRatePercent(computedAllRate, 260);
+            }
+        }
+
+        int statsAverageTime = 0;
+        if (tryExtractAverageTimeFromObject(statsObject, statsAverageTime)) {
+            // Low-priority fallback because this can include nested season/all structures.
+            considerAverageTimeMs(statsAverageTime, 80);
+        }
+        double statsForfeitRate = 0.0;
+        if (tryExtractForfeitRateFromObject(statsObject, statsForfeitRate)) {
+            // Lowest priority fallback because this can include nested season/all blobs.
+            considerForfeitRatePercent(statsForfeitRate, 80);
+        }
+    }
+
+    if (selectedForfeitRatePriority < 0) {
+        const int totalSeasonGames = std::max(0, out.seasonWinsRanked + out.seasonLossesRanked);
+        if (totalSeasonGames > 0) {
+            const double computedSeasonRate =
+                (100.0 * static_cast<double>(std::max(0, out.seasonFfsRanked))) / static_cast<double>(totalSeasonGames);
+            considerForfeitRatePercent(computedSeasonRate, 110);
+        }
+    }
+    if (selectedForfeitRatePriority >= 0) {
+        out.hasForfeitRatePercent = true;
+        out.forfeitRatePercent = static_cast<float>(selectedForfeitRatePercent);
+    }
+
+    std::string achievementsObject;
+    std::string displayArray;
+    if (ExtractJsonEnclosedAfterKey(dataObject, "achievements", '{', '}', achievementsObject) &&
+        ExtractJsonEnclosedAfterKey(achievementsObject, "display", '[', ']', displayArray)) {
+        for (const std::string& achievementObject : ExtractTopLevelObjectsFromArray(displayArray)) {
+            std::string id;
+            int value = 0;
+            if (!ExtractRegexString(achievementObject, reAchievementId, id)) continue;
+            if (!ExtractRegexInt(achievementObject, reAchievementValue, value)) continue;
+            const std::string idLower = ToLowerAsciiCopy(id);
+            if (idLower == "besttime") {
+                out.bestTimeMs = std::max(0, value);
+            } else if (idLower == "highestwinstreak") {
+                out.bestWinStreak = std::max(0, value);
+            } else if (idLower == "averagetime" || idLower == "avgtime") {
+                considerAverageTimeMs(std::max(0, value), 260);
+            }
+        }
+    }
+
+    if (selectedAverageTimePriority >= 0) {
+        out.averageTimeMs = selectedAverageTimeMs;
+    } else {
+        out.averageTimeMs = 0;
+    }
+
+    if (out.bestWinStreak <= 0) out.bestWinStreak = std::max(0, out.seasonCurrentWinStreakRanked);
+    out.ok = !out.uuid.empty() || !out.nickname.empty();
+    return out;
+}
+
+static ParsedMcsrMatchesData ParseMcsrMatchesPayload(const std::string& json, const std::string& playerUuid,
+                                                     const std::string& playerNickname) {
+    static const std::regex reIdStr("\"id\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reIdInt("\"id\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reType("\"type\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reCategory("\"category\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reGameMode("\"gameMode\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reDateEpoch("\"date\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reForfeited("\"forfeited\"\\s*:\\s*(true|false)");
+    static const std::regex reResultUuid("\"uuid\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reResultNickname("\"nickname\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reResultMcName("\"mc_name\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reResultName("\"name\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reResultTime("\"time\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reChange("\"change\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reEloRate("\"eloRate\"\\s*:\\s*(-?\\d+)");
+
+    ParsedMcsrMatchesData out;
+    std::string dataArray;
+    if (!ExtractJsonEnclosedAfterKey(json, "data", '[', ']', dataArray)) return out;
+
+    for (const std::string& matchObject : ExtractTopLevelObjectsFromArray(dataArray)) {
+        ParsedMcsrMatchSummary parsed;
+        if (!ExtractRegexString(matchObject, reIdStr, parsed.id)) {
+            int numericId = 0;
+            if (ExtractRegexInt(matchObject, reIdInt, numericId)) parsed.id = std::to_string(numericId);
+        }
+        if (parsed.id.empty()) continue;
+
+        ExtractRegexInt(matchObject, reType, parsed.type);
+        ExtractRegexString(matchObject, reCategory, parsed.category);
+        ExtractRegexString(matchObject, reGameMode, parsed.gameMode);
+        ExtractRegexInt(matchObject, reDateEpoch, parsed.dateEpochSeconds);
+        ExtractRegexBool(matchObject, reForfeited, parsed.forfeited);
+
+        std::string resultObject;
+        if (ExtractJsonEnclosedAfterKey(matchObject, "result", '{', '}', resultObject)) {
+            ExtractRegexString(resultObject, reResultUuid, parsed.resultUuid);
+            if (!ExtractRegexString(resultObject, reResultNickname, parsed.resultName)) {
+                if (!ExtractRegexString(resultObject, reResultMcName, parsed.resultName)) {
+                    ExtractRegexString(resultObject, reResultName, parsed.resultName);
+                }
+            }
+            ExtractRegexInt(resultObject, reResultTime, parsed.resultTimeMs);
+        }
+
+        std::vector<std::pair<std::string, std::string>> players;
+        std::string playersArray;
+        if (ExtractJsonEnclosedAfterKey(matchObject, "players", '[', ']', playersArray)) {
+            for (const std::string& playerObject : ExtractTopLevelObjectsFromArray(playersArray)) {
+                std::string playerUuidValue;
+                std::string playerNameValue;
+                ExtractRegexString(playerObject, reResultUuid, playerUuidValue);
+                if (!ExtractRegexString(playerObject, reResultNickname, playerNameValue)) {
+                    if (!ExtractRegexString(playerObject, reResultMcName, playerNameValue)) {
+                        if (!ExtractRegexString(playerObject, reResultName, playerNameValue)) {
+                            std::string playerUserObject;
+                            if (ExtractJsonEnclosedAfterKey(playerObject, "user", '{', '}', playerUserObject)) {
+                                if (!ExtractRegexString(playerUserObject, reResultNickname, playerNameValue)) {
+                                    if (!ExtractRegexString(playerUserObject, reResultMcName, playerNameValue)) {
+                                        ExtractRegexString(playerUserObject, reResultName, playerNameValue);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                players.emplace_back(std::move(playerUuidValue), std::move(playerNameValue));
+            }
+        }
+
+        if (parsed.resultName.empty() && !parsed.resultUuid.empty()) {
+            for (const auto& player : players) {
+                if (!player.first.empty() && EqualsIgnoreCaseAscii(player.first, parsed.resultUuid) && !player.second.empty()) {
+                    parsed.resultName = player.second;
+                    break;
+                }
+            }
+        }
+
+        for (const auto& player : players) {
+            bool isSelf = false;
+            if (!playerUuid.empty() && !player.first.empty() && EqualsIgnoreCaseAscii(player.first, playerUuid)) {
+                isSelf = true;
+            } else if (!playerNickname.empty() && !player.second.empty() && EqualsIgnoreCaseAscii(player.second, playerNickname)) {
+                isSelf = true;
+            }
+            if (!isSelf && !player.second.empty()) {
+                parsed.opponentName = player.second;
+                break;
+            }
+        }
+
+        std::string changesArray;
+        if (ExtractJsonEnclosedAfterKey(matchObject, "changes", '[', ']', changesArray)) {
+            for (const std::string& changeObject : ExtractTopLevelObjectsFromArray(changesArray)) {
+                std::string changeUuid;
+                ExtractRegexString(changeObject, reResultUuid, changeUuid);
+                const bool isSelf = !playerUuid.empty() && !changeUuid.empty() && EqualsIgnoreCaseAscii(changeUuid, playerUuid);
+                if (!isSelf && parsed.hasEloAfter) continue;
+                int eloAfter = 0;
+                if (ExtractRegexInt(changeObject, reEloRate, eloAfter)) {
+                    parsed.hasEloAfter = true;
+                    parsed.eloAfter = eloAfter;
+                }
+                ExtractRegexInt(changeObject, reChange, parsed.eloDelta);
+                if (isSelf) break;
+            }
+        }
+
+        if (parsed.resultName.empty() && !parsed.opponentName.empty() && !playerNickname.empty()) {
+            const bool opponentWon = !parsed.resultUuid.empty() && !playerUuid.empty() && !EqualsIgnoreCaseAscii(parsed.resultUuid, playerUuid);
+            if (opponentWon) { parsed.resultName = parsed.opponentName; }
+        }
+
+        if (parsed.resultName.empty() && !parsed.opponentName.empty()) {
+            const bool selfWon = !parsed.resultUuid.empty() && !playerUuid.empty() && EqualsIgnoreCaseAscii(parsed.resultUuid, playerUuid);
+            if (selfWon) { parsed.resultName = playerNickname; }
+        }
+
+        if (parsed.resultTimeMs <= 0) {
+            std::string completionTimeObject;
+            if (ExtractJsonEnclosedAfterKey(matchObject, "result", '{', '}', completionTimeObject)) {
+                ExtractRegexInt(completionTimeObject, reResultTime, parsed.resultTimeMs);
+            }
+        }
+
+        if (parsed.resultName.empty() && parsed.resultUuid.empty()) {
+            if (!ExtractRegexString(matchObject, reResultMcName, parsed.resultName)) {
+                ExtractRegexString(matchObject, reResultName, parsed.resultName);
+            }
+            if (!ExtractRegexString(resultObject, reResultMcName, parsed.resultName)) {
+                ExtractRegexString(resultObject, reResultName, parsed.resultName);
+            }
+        }
+
+        out.matches.push_back(std::move(parsed));
+    }
+
+    out.ok = true;
+    return out;
+}
+
+static ParsedMcsrMatchDetailData ParseMcsrMatchDetailPayload(const std::string& json, const std::string& playerUuid) {
+    static const std::regex reUuid("\"uuid\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reType("\"type\"\\s*:\\s*(-?\\d+)");
+    static const std::regex reTime("\"time\"\\s*:\\s*(-?\\d+)");
+
+    ParsedMcsrMatchDetailData out;
+    std::string dataObject;
+    if (!ExtractJsonEnclosedAfterKey(json, "data", '{', '}', dataObject)) return out;
+
+    std::string completionsArray;
+    if (ExtractJsonEnclosedAfterKey(dataObject, "completions", '[', ']', completionsArray)) {
+        for (const std::string& completionObject : ExtractTopLevelObjectsFromArray(completionsArray)) {
+            std::string uuid;
+            if (!ExtractRegexString(completionObject, reUuid, uuid)) continue;
+            if (!playerUuid.empty() && !EqualsIgnoreCaseAscii(uuid, playerUuid)) continue;
+            int completionMs = 0;
+            if (ExtractRegexInt(completionObject, reTime, completionMs)) {
+                out.completionTimeMs = completionMs;
+                break;
+            }
+        }
+    }
+
+    std::string timelinesArray;
+    if (ExtractJsonEnclosedAfterKey(dataObject, "timelines", '[', ']', timelinesArray)) {
+        for (const std::string& timelineObject : ExtractTopLevelObjectsFromArray(timelinesArray)) {
+            std::string uuid;
+            if (!ExtractRegexString(timelineObject, reUuid, uuid)) continue;
+            if (!playerUuid.empty() && !EqualsIgnoreCaseAscii(uuid, playerUuid)) continue;
+
+            ParsedMcsrTimelineSplit split;
+            if (!ExtractRegexInt(timelineObject, reType, split.type)) continue;
+            if (!ExtractRegexInt(timelineObject, reTime, split.timeMs)) continue;
+            out.splits.push_back(split);
+        }
+    }
+
+    std::sort(out.splits.begin(), out.splits.end(),
+              [](const ParsedMcsrTimelineSplit& a, const ParsedMcsrTimelineSplit& b) { return a.timeMs < b.timeMs; });
+    out.ok = true;
+    return out;
+}
+
+static ParsedMcsrLeaderboardData ParseMcsrLeaderboardPayload(const std::string& json) {
+    static const std::regex reNickname("\"nickname\"\\s*:\\s*\"([^\"]+)\"");
+
+    ParsedMcsrLeaderboardData out;
+    std::string dataObject;
+    if (!ExtractJsonEnclosedAfterKey(json, "data", '{', '}', dataObject)) return out;
+
+    std::string usersArray;
+    if (!ExtractJsonEnclosedAfterKey(dataObject, "users", '[', ']', usersArray)) return out;
+
+    for (const std::string& userObject : ExtractTopLevelObjectsFromArray(usersArray)) {
+        std::string nickname;
+        if (!ExtractRegexString(userObject, reNickname, nickname)) continue;
+        TrimAsciiWhitespaceInPlace(nickname);
+        if (!IsValidMinecraftUsername(nickname)) continue;
+        PushUniqueCaseInsensitive(out.nicknames, nickname, kMcsrUsernameIndexMaxNames);
+    }
+
+    out.ok = true;
+    return out;
+}
+
+static ParsedMcsrLeaderboardData ParseMcsrRecordLeaderboardPayload(const std::string& json) {
+    static const std::regex reNickname("\"nickname\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reMcName("\"mc_name\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reName("\"name\"\\s*:\\s*\"([^\"]+)\"");
+
+    ParsedMcsrLeaderboardData out;
+    std::string dataArray;
+    if (!ExtractJsonEnclosedAfterKey(json, "data", '[', ']', dataArray)) return out;
+
+    for (const std::string& rowObject : ExtractTopLevelObjectsFromArray(dataArray)) {
+        std::string userObject;
+        if (!ExtractJsonEnclosedAfterKey(rowObject, "user", '{', '}', userObject)) continue;
+
+        std::string nickname;
+        if (!ExtractRegexString(userObject, reNickname, nickname)) {
+            if (!ExtractRegexString(userObject, reMcName, nickname)) {
+                ExtractRegexString(userObject, reName, nickname);
+            }
+        }
+
+        TrimAsciiWhitespaceInPlace(nickname);
+        if (!IsValidMinecraftUsername(nickname)) continue;
+        PushUniqueCaseInsensitive(out.nicknames, nickname, kMcsrUsernameIndexMaxNames);
+    }
+
+    out.ok = true;
+    return out;
+}
+
+static ParsedMcsrMatchFeedUsernamesData ParseMcsrMatchFeedUsernamesPayload(const std::string& json) {
+    static const std::regex reNickname("\"nickname\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reMcName("\"mc_name\"\\s*:\\s*\"([^\"]+)\"");
+    static const std::regex reName("\"name\"\\s*:\\s*\"([^\"]+)\"");
+
+    ParsedMcsrMatchFeedUsernamesData out;
+    std::string dataArray;
+    if (!ExtractJsonEnclosedAfterKey(json, "data", '[', ']', dataArray)) return out;
+
+    const std::vector<std::string> matches = ExtractTopLevelObjectsFromArray(dataArray);
+    out.hasRows = !matches.empty();
+
+    for (const std::string& matchObject : matches) {
+        std::string playersArray;
+        if (!ExtractJsonEnclosedAfterKey(matchObject, "players", '[', ']', playersArray)) continue;
+        for (const std::string& playerObject : ExtractTopLevelObjectsFromArray(playersArray)) {
+            std::string nickname;
+            if (!ExtractRegexString(playerObject, reNickname, nickname)) {
+                if (!ExtractRegexString(playerObject, reMcName, nickname)) {
+                    if (!ExtractRegexString(playerObject, reName, nickname)) {
+                        std::string userObject;
+                        if (ExtractJsonEnclosedAfterKey(playerObject, "user", '{', '}', userObject)) {
+                            if (!ExtractRegexString(userObject, reNickname, nickname)) {
+                                if (!ExtractRegexString(userObject, reMcName, nickname)) {
+                                    ExtractRegexString(userObject, reName, nickname);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            TrimAsciiWhitespaceInPlace(nickname);
+            if (!IsValidMinecraftUsername(nickname)) continue;
+            PushUniqueCaseInsensitive(out.nicknames, nickname, kMcsrUsernameIndexMaxNames);
+        }
+    }
+
+    out.ok = true;
+    return out;
+}
+
+static bool DidPlayerWinMatch(const ParsedMcsrMatchSummary& match, const ParsedMcsrUserData& user) {
+    if (!user.uuid.empty() && !match.resultUuid.empty()) { return EqualsIgnoreCaseAscii(user.uuid, match.resultUuid); }
+    if (!user.nickname.empty() && !match.resultName.empty()) { return EqualsIgnoreCaseAscii(user.nickname, match.resultName); }
+    if (!match.resultName.empty() && !user.nickname.empty()) { return ToLowerAsciiCopy(match.resultName) == ToLowerAsciiCopy(user.nickname); }
+    return false;
+}
+
+static int ClassifyMcsrMatchOutcome(const ParsedMcsrMatchSummary& match, const ParsedMcsrUserData& user) {
+    if (match.resultUuid.empty() && match.resultName.empty()) return 0;
+    return DidPlayerWinMatch(match, user) ? 1 : -1;
+}
+
+static void ResetMcsrApiRateLimitBackoff() {
+    s_mcsrApiRateLimitUntil = std::chrono::steady_clock::time_point::min();
+    s_mcsrApiRateLimitExponent = 0;
+}
+
+static int RegisterMcsrApiRateLimitBackoff(int pollIntervalMs) {
+    const int baseSeconds = std::max(30, pollIntervalMs / 1000);
+    const int exponent = std::clamp(s_mcsrApiRateLimitExponent, 0, 4);
+    int waitSeconds = baseSeconds;
+    waitSeconds *= (1 << exponent);
+    waitSeconds = std::clamp(waitSeconds, 30, 300);
+    s_mcsrApiRateLimitUntil = std::chrono::steady_clock::now() + std::chrono::seconds(waitSeconds);
+    s_nextMcsrApiTrackerPollTime = s_mcsrApiRateLimitUntil;
+    s_mcsrApiRateLimitExponent = std::clamp(s_mcsrApiRateLimitExponent + 1, 0, 6);
+    return waitSeconds;
+}
+
+static void MaybeRefreshMcsrUsernameIndex(const std::wstring& extraHeaders, bool forceRefresh) {
+    LoadMcsrUsernameIndexFromDiskIfNeeded();
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!forceRefresh && now < s_mcsrUsernameIndexNextRefresh) return;
+
+    std::vector<std::string> mergedNames = s_mcsrLeaderboardSuggestions;
+    bool gotAnyData = false;
+    bool hitRateLimit = false;
+
+    auto mergeNames = [&](const std::vector<std::string>& names) {
+        for (const std::string& name : names) {
+            PushUniqueCaseInsensitive(mergedNames, name, kMcsrUsernameIndexMaxNames);
+            if (mergedNames.size() >= kMcsrUsernameIndexMaxNames) break;
+        }
+    };
+
+    {
+        std::string payload;
+        DWORD statusCode = 0;
+        DWORD lastError = 0;
+        if (HttpGetMcsrJson(L"/api/leaderboard", payload, &statusCode, &lastError, extraHeaders)) {
+            ParsedMcsrLeaderboardData parsed = ParseMcsrLeaderboardPayload(payload);
+            if (parsed.ok) {
+                if (!parsed.nicknames.empty()) gotAnyData = true;
+                mergeNames(parsed.nicknames);
+            }
+        } else if (statusCode == 429) {
+            hitRateLimit = true;
+        }
+    }
+
+    if (!hitRateLimit) {
+        std::string payload;
+        DWORD statusCode = 0;
+        DWORD lastError = 0;
+        if (HttpGetMcsrJson(L"/api/record-leaderboard", payload, &statusCode, &lastError, extraHeaders)) {
+            ParsedMcsrLeaderboardData parsed = ParseMcsrRecordLeaderboardPayload(payload);
+            if (parsed.ok) {
+                if (!parsed.nicknames.empty()) gotAnyData = true;
+                mergeNames(parsed.nicknames);
+            }
+        } else if (statusCode == 429) {
+            hitRateLimit = true;
+        }
+    }
+
+    if (!hitRateLimit) {
+        for (int page = 0; page < kMcsrUsernameIndexMatchPagesPerRefresh; ++page) {
+            std::wstring path = L"/api/matches?page=" + std::to_wstring(page);
+            std::string payload;
+            DWORD statusCode = 0;
+            DWORD lastError = 0;
+            if (!HttpGetMcsrJson(path, payload, &statusCode, &lastError, extraHeaders)) {
+                if (statusCode == 429) hitRateLimit = true;
+                break;
+            }
+
+            ParsedMcsrMatchFeedUsernamesData parsed = ParseMcsrMatchFeedUsernamesPayload(payload);
+            if (!parsed.ok) break;
+            if (!parsed.hasRows) break;
+            if (!parsed.nicknames.empty()) {
+                gotAnyData = true;
+                mergeNames(parsed.nicknames);
+            }
+            if (mergedNames.size() >= kMcsrUsernameIndexMaxNames) break;
+        }
+    }
+
+    if (gotAnyData && !mergedNames.empty()) {
+        std::sort(mergedNames.begin(), mergedNames.end(), [](const std::string& a, const std::string& b) {
+            return ToLowerAsciiCopy(a) < ToLowerAsciiCopy(b);
+        });
+        s_mcsrLeaderboardSuggestions = mergedNames;
+        (void)SaveMcsrUsernameIndexToDisk(s_mcsrLeaderboardSuggestions);
+        s_mcsrUsernameIndexNextRefresh = now + std::chrono::seconds(kMcsrUsernameIndexWeeklyRefreshSeconds);
+        return;
+    }
+
+    if (hitRateLimit) {
+        s_mcsrUsernameIndexNextRefresh = now + std::chrono::seconds(kMcsrUsernameIndexRefreshRetrySeconds);
+    } else if (s_mcsrLeaderboardSuggestions.empty()) {
+        s_mcsrUsernameIndexNextRefresh = now + std::chrono::minutes(15);
+    } else {
+        s_mcsrUsernameIndexNextRefresh = now + std::chrono::hours(6);
+    }
+}
+
+static std::string SanitizeMcsrAssetKey(const std::string& source, size_t maxLen = 64) {
+    std::string out;
+    out.reserve(std::min(source.size(), maxLen));
+    for (unsigned char c : source) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+            out.push_back(static_cast<char>(std::tolower(c)));
+            if (out.size() >= maxLen) break;
+        }
+    }
+    return out;
+}
+
+static std::filesystem::path GetMcsrAssetCacheRootPath() {
+    std::wstring localAppData;
+    if (TryReadEnvironmentVariable(L"LOCALAPPDATA", localAppData) && !localAppData.empty()) {
+        return std::filesystem::path(localAppData) / L"Toolscreen" / L"cache" / L"mcsr";
+    }
+    std::wstring tempDir;
+    if (TryReadEnvironmentVariable(L"TEMP", tempDir) && !tempDir.empty()) {
+        return std::filesystem::path(tempDir) / L"toolscreen_mcsr_cache";
+    }
+    return std::filesystem::path(L".") / L"toolscreen_mcsr_cache";
+}
+
+static bool TryWriteBinaryFile(const std::filesystem::path& filePath, const std::vector<unsigned char>& bytes) {
+    if (bytes.empty()) return false;
+    std::error_code ec;
+    std::filesystem::create_directories(filePath.parent_path(), ec);
+    if (ec) return false;
+
+    const std::filesystem::path tempPath = filePath.wstring() + L".tmp";
+    {
+        std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) return false;
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out.good()) return false;
+    }
+
+    std::filesystem::rename(tempPath, filePath, ec);
+    if (!ec) return true;
+    ec.clear();
+    std::filesystem::remove(filePath, ec);
+    ec.clear();
+    std::filesystem::rename(tempPath, filePath, ec);
+    return !ec;
+}
+
+static bool LooksLikeImageBytes(const std::vector<unsigned char>& bytes) {
+    if (bytes.size() >= 8) {
+        // PNG: 89 50 4E 47 0D 0A 1A 0A
+        if (bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 && bytes[4] == 0x0D &&
+            bytes[5] == 0x0A && bytes[6] == 0x1A && bytes[7] == 0x0A) {
+            return true;
+        }
+    }
+    if (bytes.size() >= 3) {
+        // JPEG: FF D8 FF
+        if (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return true;
+    }
+    if (bytes.size() >= 12) {
+        // WEBP: RIFF....WEBP
+        if (bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F' && bytes[8] == 'W' && bytes[9] == 'E' &&
+            bytes[10] == 'B' && bytes[11] == 'P') {
+            return true;
+        }
+    }
+    if (bytes.size() >= 6) {
+        // GIF87a/GIF89a
+        if (bytes[0] == 'G' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == '8' &&
+            (bytes[4] == '7' || bytes[4] == '9') && bytes[5] == 'a') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool FileLooksLikeImage(const std::filesystem::path& filePath) {
+    std::ifstream in(filePath, std::ios::binary);
+    if (!in.is_open()) return false;
+    std::vector<unsigned char> header(16, 0);
+    in.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    const std::streamsize readCount = in.gcount();
+    if (readCount <= 0) return false;
+    header.resize(static_cast<size_t>(readCount));
+    return LooksLikeImageBytes(header);
+}
+
+static std::string RemoveUuidDashes(std::string uuidText) {
+    uuidText.erase(std::remove(uuidText.begin(), uuidText.end(), '-'), uuidText.end());
+    return uuidText;
+}
+
+static std::filesystem::path GetMcsrTrackerCacheDbRootPath() {
+    return GetMcsrAssetCacheRootPath() / L"tracker_db";
+}
+
+static std::filesystem::path GetMcsrTrackerCachePathForKey(const std::string& cacheKey) {
+    const std::string normalized = SanitizeMcsrAssetKey(cacheKey, 96);
+    if (normalized.empty()) return {};
+    return GetMcsrTrackerCacheDbRootPath() / L"users" / (Utf8ToWide(normalized) + L".json");
+}
+
+static void ApplyMcsrTrackerRuntimeEnvelope(McsrApiTrackerRuntimeState& state, bool enabled, bool visible, bool initializedVisibility,
+                                            const std::string& autoDetectedPlayer, const std::string& autoDetectedUuid,
+                                            const std::string& requestedIdentifier) {
+    state.enabled = enabled;
+    state.visible = visible;
+    state.initializedVisibility = initializedVisibility;
+    state.autoDetectedPlayer = autoDetectedPlayer;
+    state.autoDetectedUuid = autoDetectedUuid;
+    state.requestedPlayer = requestedIdentifier;
+    if (state.displayPlayer.empty()) state.displayPlayer = requestedIdentifier;
+}
+
+static bool TrySerializeMcsrTrackerCache(const McsrApiTrackerRuntimeState& state, std::string& outJsonText) {
+    try {
+        nlohmann::json j = nlohmann::json::object();
+        j["schema"] = 1;
+        j["savedEpochSeconds"] = static_cast<long long>(std::time(nullptr));
+
+        j["displayPlayer"] = state.displayPlayer;
+        j["requestedPlayer"] = state.requestedPlayer;
+        j["country"] = state.country;
+        j["userUuid"] = state.userUuid;
+        j["avatarImagePath"] = state.avatarImagePath;
+        j["flagImagePath"] = state.flagImagePath;
+        j["eloRank"] = state.eloRank;
+        j["eloRate"] = state.eloRate;
+        j["peakElo"] = state.peakElo;
+        j["seasonWins"] = state.seasonWins;
+        j["seasonLosses"] = state.seasonLosses;
+        j["seasonCompletions"] = state.seasonCompletions;
+        j["seasonPoints"] = state.seasonPoints;
+        j["bestWinStreak"] = state.bestWinStreak;
+        j["bestTimeMs"] = state.bestTimeMs;
+        j["profileAverageTimeMs"] = state.profileAverageTimeMs;
+        j["averageResultTimeMs"] = state.averageResultTimeMs;
+        j["seasonFfs"] = state.seasonFfs;
+        j["seasonDodges"] = state.seasonDodges;
+        j["seasonCurrentWinStreak"] = state.seasonCurrentWinStreak;
+        j["recentWins"] = state.recentWins;
+        j["recentLosses"] = state.recentLosses;
+        j["recentDraws"] = state.recentDraws;
+        j["recentForfeitRatePercent"] = state.recentForfeitRatePercent;
+        j["profileForfeitRatePercent"] = state.profileForfeitRatePercent;
+        j["lastMatchId"] = state.lastMatchId;
+        j["lastResultLabel"] = state.lastResultLabel;
+        j["lastResultTimeMs"] = state.lastResultTimeMs;
+        j["statusLabel"] = state.statusLabel;
+        j["apiOnline"] = state.apiOnline;
+        j["eloHistory"] = state.eloHistory;
+        j["splitLines"] = state.splitLines;
+        j["suggestedPlayers"] = state.suggestedPlayers;
+
+        nlohmann::json recentMatches = nlohmann::json::array();
+        for (const auto& row : state.recentMatches) {
+            nlohmann::json outRow = nlohmann::json::object();
+            outRow["opponent"] = row.opponent;
+            outRow["resultLabel"] = row.resultLabel;
+            outRow["detailLabel"] = row.detailLabel;
+            outRow["ageLabel"] = row.ageLabel;
+            outRow["resultType"] = row.resultType;
+            outRow["forfeited"] = row.forfeited;
+            outRow["categoryType"] = row.categoryType;
+            recentMatches.push_back(std::move(outRow));
+        }
+        j["recentMatches"] = std::move(recentMatches);
+
+        nlohmann::json trendPoints = nlohmann::json::array();
+        for (const auto& point : state.eloTrendPoints) {
+            nlohmann::json outPoint = nlohmann::json::object();
+            outPoint["elo"] = point.elo;
+            outPoint["opponent"] = point.opponent;
+            outPoint["resultLabel"] = point.resultLabel;
+            outPoint["detailLabel"] = point.detailLabel;
+            outPoint["ageLabel"] = point.ageLabel;
+            trendPoints.push_back(std::move(outPoint));
+        }
+        j["eloTrendPoints"] = std::move(trendPoints);
+
+        outJsonText = j.dump(2);
+        return !outJsonText.empty();
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool TryDeserializeMcsrTrackerCache(const std::string& jsonText, McsrApiTrackerRuntimeState& outState,
+                                           std::time_t* outSavedEpochSeconds = nullptr) {
+    if (outSavedEpochSeconds) *outSavedEpochSeconds = 0;
+    try {
+        const nlohmann::json j = nlohmann::json::parse(jsonText, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) return false;
+        if (j.contains("schema") && j["schema"].is_number_integer() && j["schema"].get<int>() != 1) return false;
+
+        McsrApiTrackerRuntimeState state;
+
+        auto readString = [&](const char* key, std::string& out) {
+            auto it = j.find(key);
+            if (it != j.end() && it->is_string()) out = it->get<std::string>();
+        };
+        auto readInt = [&](const char* key, int& out) {
+            auto it = j.find(key);
+            if (it == j.end()) return;
+            if (it->is_number_integer()) {
+                out = it->get<int>();
+            } else if (it->is_number_float()) {
+                out = static_cast<int>(std::lround(it->get<double>()));
+            }
+        };
+        auto readFloat = [&](const char* key, float& out) {
+            auto it = j.find(key);
+            if (it == j.end()) return;
+            if (it->is_number()) out = static_cast<float>(it->get<double>());
+        };
+        auto readBool = [&](const char* key, bool& out) {
+            auto it = j.find(key);
+            if (it != j.end() && it->is_boolean()) out = it->get<bool>();
+        };
+
+        readString("displayPlayer", state.displayPlayer);
+        readString("requestedPlayer", state.requestedPlayer);
+        readString("country", state.country);
+        readString("userUuid", state.userUuid);
+        readString("avatarImagePath", state.avatarImagePath);
+        readString("flagImagePath", state.flagImagePath);
+        readString("lastMatchId", state.lastMatchId);
+        readString("lastResultLabel", state.lastResultLabel);
+        readString("statusLabel", state.statusLabel);
+
+        readInt("eloRank", state.eloRank);
+        readInt("eloRate", state.eloRate);
+        readInt("peakElo", state.peakElo);
+        readInt("seasonWins", state.seasonWins);
+        readInt("seasonLosses", state.seasonLosses);
+        readInt("seasonCompletions", state.seasonCompletions);
+        readInt("seasonPoints", state.seasonPoints);
+        readInt("bestWinStreak", state.bestWinStreak);
+        readInt("bestTimeMs", state.bestTimeMs);
+        readInt("profileAverageTimeMs", state.profileAverageTimeMs);
+        readInt("averageResultTimeMs", state.averageResultTimeMs);
+        readInt("seasonFfs", state.seasonFfs);
+        readInt("seasonDodges", state.seasonDodges);
+        readInt("seasonCurrentWinStreak", state.seasonCurrentWinStreak);
+        readInt("recentWins", state.recentWins);
+        readInt("recentLosses", state.recentLosses);
+        readInt("recentDraws", state.recentDraws);
+        readInt("lastResultTimeMs", state.lastResultTimeMs);
+
+        readFloat("recentForfeitRatePercent", state.recentForfeitRatePercent);
+        readFloat("profileForfeitRatePercent", state.profileForfeitRatePercent);
+        readBool("apiOnline", state.apiOnline);
+
+        constexpr size_t kMaxCachedRows = 256;
+        auto histIt = j.find("eloHistory");
+        if (histIt != j.end() && histIt->is_array()) {
+            for (const auto& value : *histIt) {
+                if (!value.is_number()) continue;
+                state.eloHistory.push_back(static_cast<int>(std::lround(value.get<double>())));
+                if (state.eloHistory.size() >= kMaxCachedRows) break;
+            }
+        }
+
+        auto splitIt = j.find("splitLines");
+        if (splitIt != j.end() && splitIt->is_array()) {
+            for (const auto& value : *splitIt) {
+                if (!value.is_string()) continue;
+                state.splitLines.push_back(value.get<std::string>());
+                if (state.splitLines.size() >= kMaxCachedRows) break;
+            }
+        }
+
+        auto suggestedIt = j.find("suggestedPlayers");
+        if (suggestedIt != j.end() && suggestedIt->is_array()) {
+            for (const auto& value : *suggestedIt) {
+                if (!value.is_string()) continue;
+                PushUniqueCaseInsensitive(state.suggestedPlayers, value.get<std::string>(), kMcsrUsernameIndexMaxNames);
+            }
+        }
+
+        auto matchesIt = j.find("recentMatches");
+        if (matchesIt != j.end() && matchesIt->is_array()) {
+            for (const auto& value : *matchesIt) {
+                if (!value.is_object()) continue;
+                McsrApiTrackerRuntimeState::MatchRow row;
+                if (value.contains("opponent") && value["opponent"].is_string()) row.opponent = value["opponent"].get<std::string>();
+                if (value.contains("resultLabel") && value["resultLabel"].is_string()) {
+                    row.resultLabel = value["resultLabel"].get<std::string>();
+                }
+                if (value.contains("detailLabel") && value["detailLabel"].is_string()) {
+                    row.detailLabel = value["detailLabel"].get<std::string>();
+                }
+                if (value.contains("ageLabel") && value["ageLabel"].is_string()) row.ageLabel = value["ageLabel"].get<std::string>();
+                if (value.contains("resultType") && value["resultType"].is_number()) {
+                    row.resultType = static_cast<int>(std::lround(value["resultType"].get<double>()));
+                }
+                if (value.contains("forfeited") && value["forfeited"].is_boolean()) row.forfeited = value["forfeited"].get<bool>();
+                if (value.contains("categoryType") && value["categoryType"].is_number()) {
+                    row.categoryType = static_cast<int>(std::lround(value["categoryType"].get<double>()));
+                }
+                state.recentMatches.push_back(std::move(row));
+                if (state.recentMatches.size() >= kMaxCachedRows) break;
+            }
+        }
+
+        auto trendIt = j.find("eloTrendPoints");
+        if (trendIt != j.end() && trendIt->is_array()) {
+            for (const auto& value : *trendIt) {
+                if (!value.is_object()) continue;
+                McsrApiTrackerRuntimeState::TrendPoint point;
+                if (value.contains("elo") && value["elo"].is_number()) point.elo = static_cast<int>(std::lround(value["elo"].get<double>()));
+                if (value.contains("opponent") && value["opponent"].is_string()) point.opponent = value["opponent"].get<std::string>();
+                if (value.contains("resultLabel") && value["resultLabel"].is_string()) {
+                    point.resultLabel = value["resultLabel"].get<std::string>();
+                }
+                if (value.contains("detailLabel") && value["detailLabel"].is_string()) {
+                    point.detailLabel = value["detailLabel"].get<std::string>();
+                }
+                if (value.contains("ageLabel") && value["ageLabel"].is_string()) point.ageLabel = value["ageLabel"].get<std::string>();
+                state.eloTrendPoints.push_back(std::move(point));
+                if (state.eloTrendPoints.size() >= kMaxCachedRows) break;
+            }
+        }
+
+        if (outSavedEpochSeconds) {
+            auto savedIt = j.find("savedEpochSeconds");
+            if (savedIt != j.end() && savedIt->is_number_integer()) {
+                const long long epoch = savedIt->get<long long>();
+                if (epoch > 0) *outSavedEpochSeconds = static_cast<std::time_t>(epoch);
+            }
+        }
+
+        if (state.displayPlayer.empty() && state.requestedPlayer.empty()) return false;
+        outState = std::move(state);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool TrySaveMcsrTrackerCacheByKey(const std::string& key, const McsrApiTrackerRuntimeState& state) {
+    const std::filesystem::path cachePath = GetMcsrTrackerCachePathForKey(key);
+    if (cachePath.empty()) return false;
+
+    std::string jsonText;
+    if (!TrySerializeMcsrTrackerCache(state, jsonText) || jsonText.empty()) return false;
+    const std::vector<unsigned char> bytes(jsonText.begin(), jsonText.end());
+    return TryWriteBinaryFile(cachePath, bytes);
+}
+
+static bool TryLoadMcsrTrackerCacheByKey(const std::string& key, McsrApiTrackerRuntimeState& outState,
+                                         std::time_t* outSavedEpochSeconds = nullptr) {
+    const std::filesystem::path cachePath = GetMcsrTrackerCachePathForKey(key);
+    if (cachePath.empty()) return false;
+    std::string jsonText;
+    if (!TryReadSmallTextFile(cachePath, jsonText, 1024 * 1024)) return false;
+    if (!TryDeserializeMcsrTrackerCache(jsonText, outState, outSavedEpochSeconds)) return false;
+    return true;
+}
+
+static bool TryLoadMcsrTrackerCache(const std::string& requestedIdentifier, const std::string& autoDetectedUuid,
+                                    McsrApiTrackerRuntimeState& outState, std::time_t* outSavedEpochSeconds = nullptr) {
+    if (outSavedEpochSeconds) *outSavedEpochSeconds = 0;
+
+    std::vector<std::string> keysToTry;
+    auto pushKey = [&](std::string value) {
+        TrimAsciiWhitespaceInPlace(value);
+        if (value.empty()) return;
+        for (const std::string& existing : keysToTry) {
+            if (EqualsIgnoreCaseAscii(existing, value)) return;
+        }
+        keysToTry.push_back(std::move(value));
+    };
+
+    pushKey(requestedIdentifier);
+    pushKey(autoDetectedUuid);
+    pushKey(RemoveUuidDashes(autoDetectedUuid));
+    if (IsLikelyMinecraftUuid(requestedIdentifier)) pushKey(RemoveUuidDashes(requestedIdentifier));
+
+    for (const std::string& key : keysToTry) {
+        McsrApiTrackerRuntimeState candidate;
+        std::time_t candidateSavedEpoch = 0;
+        if (!TryLoadMcsrTrackerCacheByKey(key, candidate, &candidateSavedEpoch)) continue;
+        outState = std::move(candidate);
+        if (outSavedEpochSeconds) *outSavedEpochSeconds = candidateSavedEpoch;
+        return true;
+    }
+    return false;
+}
+
+static void SaveMcsrTrackerCache(const std::string& requestedIdentifier, const McsrApiTrackerRuntimeState& state) {
+    std::vector<std::string> keys;
+    auto pushKey = [&](std::string value) {
+        TrimAsciiWhitespaceInPlace(value);
+        if (value.empty()) return;
+        for (const std::string& existing : keys) {
+            if (EqualsIgnoreCaseAscii(existing, value)) return;
+        }
+        keys.push_back(std::move(value));
+    };
+
+    pushKey(requestedIdentifier);
+    pushKey(state.displayPlayer);
+    pushKey(state.requestedPlayer);
+    pushKey(state.userUuid);
+    pushKey(RemoveUuidDashes(state.userUuid));
+
+    for (const std::string& key : keys) {
+        (void)TrySaveMcsrTrackerCacheByKey(key, state);
+    }
+}
+
+static bool TryCacheMcsrAvatar(const std::string& playerName, const std::string& uuid, std::string& outPathUtf8) {
+    outPathUtf8.clear();
+    const std::string uuidNoDash = SanitizeMcsrAssetKey(RemoveUuidDashes(uuid), 48);
+    const std::string playerKey = SanitizeMcsrAssetKey(playerName, 32);
+    std::string key = !uuidNoDash.empty() ? uuidNoDash : playerKey;
+    if (key.empty()) return false;
+
+    const std::filesystem::path avatarPath = GetMcsrAssetCacheRootPath() / L"avatars" / (L"head3d_v2_" + Utf8ToWide(key) + L".png");
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(avatarPath, ec) && !ec && std::filesystem::is_regular_file(avatarPath, ec) && !ec &&
+            std::filesystem::file_size(avatarPath, ec) > 0 && !ec) {
+            if (FileLooksLikeImage(avatarPath)) {
+                outPathUtf8 = WideToUtf8(avatarPath.wstring());
+                return true;
+            }
+            std::filesystem::remove(avatarPath, ec);
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrAssetCacheMutex);
+        if (s_mcsrAssetCacheState.avatarKey == key && now < s_mcsrAssetCacheState.nextAvatarFetch) {
+            outPathUtf8 = s_mcsrAssetCacheState.avatarPath;
+            return !outPathUtf8.empty();
+        }
+    }
+
+    std::vector<unsigned char> bytes;
+    DWORD statusCode = 0;
+    DWORD lastError = 0;
+    bool ok = false;
+    auto tryFetchAvatar = [&](const wchar_t* host, const std::wstring& path) -> bool {
+        bytes.clear();
+        statusCode = 0;
+        lastError = 0;
+        return HttpGetBinary(host, INTERNET_DEFAULT_HTTPS_PORT, path.c_str(), 2200, true, bytes, &statusCode, &lastError);
+    };
+    if (!uuidNoDash.empty()) {
+        ok = tryFetchAvatar(L"crafatar.com", L"/renders/head/" + Utf8ToWide(uuidNoDash) + L"?size=96&overlay");
+    }
+    if (!ok && !uuidNoDash.empty()) {
+        ok = tryFetchAvatar(L"crafatar.com", L"/avatars/" + Utf8ToWide(uuidNoDash) + L"?size=96&overlay");
+    }
+    if (!ok && !uuidNoDash.empty()) {
+        ok = tryFetchAvatar(L"visage.surgeplay.com", L"/head/96/" + Utf8ToWide(uuidNoDash));
+    }
+    if (!ok && !playerKey.empty()) {
+        ok = tryFetchAvatar(L"crafatar.com", L"/renders/head/" + Utf8ToWide(playerKey) + L"?size=96&overlay");
+    }
+    if (!ok && !playerKey.empty()) {
+        ok = tryFetchAvatar(L"crafatar.com", L"/avatars/" + Utf8ToWide(playerKey) + L"?size=96&overlay");
+    }
+    if (!ok && !playerKey.empty()) {
+        ok = tryFetchAvatar(L"mc-heads.net", L"/avatar/" + Utf8ToWide(playerKey) + L"/96");
+    }
+    if (!ok && !playerKey.empty()) {
+        ok = tryFetchAvatar(L"minotar.net", L"/helm/" + Utf8ToWide(playerKey) + L"/96.png");
+    }
+    if (!ok && !playerKey.empty()) {
+        ok = tryFetchAvatar(L"minotar.net", L"/avatar/" + Utf8ToWide(playerKey) + L"/96.png");
+    }
+
+    if (ok && LooksLikeImageBytes(bytes) && TryWriteBinaryFile(avatarPath, bytes)) {
+        outPathUtf8 = WideToUtf8(avatarPath.wstring());
+        std::lock_guard<std::mutex> lock(s_mcsrAssetCacheMutex);
+        s_mcsrAssetCacheState.avatarKey = key;
+        s_mcsrAssetCacheState.avatarPath = outPathUtf8;
+        s_mcsrAssetCacheState.nextAvatarFetch = now + std::chrono::hours(6);
+        return true;
+    }
+    if (ok && !LooksLikeImageBytes(bytes)) {
+        Log("[MCSR] Avatar fetch returned non-image content for '" + key + "'.");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrAssetCacheMutex);
+        s_mcsrAssetCacheState.avatarKey = key;
+        s_mcsrAssetCacheState.avatarPath.clear();
+        s_mcsrAssetCacheState.nextAvatarFetch = now + std::chrono::seconds(45);
+    }
+    if (!ok) {
+        Log("[MCSR] Avatar fetch failed for '" + key + "' (status=" + std::to_string(statusCode) +
+            ", error=" + std::to_string(lastError) + ").");
+    }
+    return false;
+}
+
+static bool TryCacheMcsrFlag(const std::string& countryCode, std::string& outPathUtf8) {
+    outPathUtf8.clear();
+    std::string key = SanitizeMcsrAssetKey(countryCode, 4);
+    if (key.size() < 2) return false;
+    if (key.size() > 2) key.resize(2);
+
+    const std::filesystem::path flagPath = GetMcsrAssetCacheRootPath() / L"flags" / (L"v2_" + Utf8ToWide(key) + L".png");
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(flagPath, ec) && !ec && std::filesystem::is_regular_file(flagPath, ec) && !ec &&
+            std::filesystem::file_size(flagPath, ec) > 0 && !ec) {
+            if (FileLooksLikeImage(flagPath)) {
+                outPathUtf8 = WideToUtf8(flagPath.wstring());
+                return true;
+            }
+            std::filesystem::remove(flagPath, ec);
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrAssetCacheMutex);
+        if (s_mcsrAssetCacheState.flagKey == key && now < s_mcsrAssetCacheState.nextFlagFetch) {
+            outPathUtf8 = s_mcsrAssetCacheState.flagPath;
+            return !outPathUtf8.empty();
+        }
+    }
+
+    std::vector<unsigned char> bytes;
+    DWORD statusCode = 0;
+    DWORD lastError = 0;
+    bool ok = false;
+    auto tryFetchFlag = [&](const wchar_t* host, const std::wstring& path) -> bool {
+        bytes.clear();
+        statusCode = 0;
+        lastError = 0;
+        return HttpGetBinary(host, INTERNET_DEFAULT_HTTPS_PORT, path.c_str(), 2200, true, bytes, &statusCode, &lastError);
+    };
+
+    ok = tryFetchFlag(L"flagcdn.com", L"/w40/" + Utf8ToWide(key) + L".png");
+    if (!ok) {
+        std::string keyUpper = key;
+        std::transform(keyUpper.begin(), keyUpper.end(), keyUpper.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        ok = tryFetchFlag(L"flagsapi.com", L"/" + Utf8ToWide(keyUpper) + L"/flat/32.png");
+    }
+    if (!ok) {
+        ok = tryFetchFlag(L"flagcdn.com", L"/" + Utf8ToWide(key) + L".png");
+    }
+    if (!ok && key.size() == 2) {
+        const unsigned int cp0 = 0x1F1E6u + static_cast<unsigned int>(std::toupper(static_cast<unsigned char>(key[0])) - 'A');
+        const unsigned int cp1 = 0x1F1E6u + static_cast<unsigned int>(std::toupper(static_cast<unsigned char>(key[1])) - 'A');
+        std::ostringstream emojiPath;
+        emojiPath << "/ajax/libs/twemoji/14.0.2/72x72/" << std::hex << std::nouppercase << cp0 << "-" << cp1 << ".png";
+        ok = tryFetchFlag(L"cdnjs.cloudflare.com", Utf8ToWide(emojiPath.str()));
+    }
+
+    if (ok && LooksLikeImageBytes(bytes) && TryWriteBinaryFile(flagPath, bytes)) {
+        outPathUtf8 = WideToUtf8(flagPath.wstring());
+        std::lock_guard<std::mutex> lock(s_mcsrAssetCacheMutex);
+        s_mcsrAssetCacheState.flagKey = key;
+        s_mcsrAssetCacheState.flagPath = outPathUtf8;
+        s_mcsrAssetCacheState.nextFlagFetch = now + std::chrono::hours(24);
+        return true;
+    }
+    if (ok && !LooksLikeImageBytes(bytes)) { Log("[MCSR] Flag fetch returned non-image content for '" + key + "'."); }
+
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrAssetCacheMutex);
+        s_mcsrAssetCacheState.flagKey = key;
+        s_mcsrAssetCacheState.flagPath.clear();
+        s_mcsrAssetCacheState.nextFlagFetch = now + std::chrono::minutes(2);
+    }
+    if (!ok) {
+        Log("[MCSR] Flag fetch failed for '" + key + "' (status=" + std::to_string(statusCode) + ", error=" +
+            std::to_string(lastError) + ").");
+    }
+    return false;
+}
+
+static void UpdateMcsrApiTrackerState(const McsrTrackerOverlayConfig& trackerCfg) {
+    const bool trackerEnabled = trackerCfg.enabled;
+    const bool refreshOnlyMode = trackerCfg.refreshOnlyMode;
+    const int pollIntervalMs = std::clamp(trackerCfg.pollIntervalMs, 10000, 3600000);
+    const auto now = std::chrono::steady_clock::now();
+    const bool forceRefresh = s_mcsrApiTrackerForceRefresh.exchange(false, std::memory_order_relaxed);
+
+    bool runtimeVisible = false;
+    bool runtimeInitializedVisibility = false;
+    McsrApiTrackerRuntimeState previousState;
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        if (!s_mcsrApiTrackerState.initializedVisibility) {
+            s_mcsrApiTrackerState.visible = false;
+            s_mcsrApiTrackerState.initializedVisibility = true;
+        }
+        previousState = s_mcsrApiTrackerState;
+        s_mcsrApiTrackerState.enabled = trackerEnabled;
+        runtimeVisible = s_mcsrApiTrackerState.visible;
+        runtimeInitializedVisibility = s_mcsrApiTrackerState.initializedVisibility;
+    }
+
+    if (!trackerEnabled) {
+        ResetMcsrApiRateLimitBackoff();
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        s_mcsrApiTrackerState = McsrApiTrackerRuntimeState{};
+        s_mcsrApiTrackerState.enabled = false;
+        s_mcsrApiTrackerState.visible = false;
+        s_mcsrApiTrackerState.initializedVisibility = true;
+        s_mcsrApiTrackerState.statusLabel = "MCSR tracker disabled.";
+        return;
+    }
+
+    std::string manualPlayer = trackerCfg.player;
+    TrimAsciiWhitespaceInPlace(manualPlayer);
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrSearchOverrideMutex);
+        if (!s_mcsrSearchOverridePlayer.empty()) { manualPlayer = s_mcsrSearchOverridePlayer; }
+    }
+    std::string autoDetectedPlayer;
+    std::string autoDetectedUuid;
+    if (trackerCfg.autoDetectPlayer) { (void)TryResolveMcsrAutoDetectedIdentity(autoDetectedPlayer, autoDetectedUuid); }
+    std::string requestedIdentifier = manualPlayer;
+    if (requestedIdentifier.empty()) {
+        requestedIdentifier = !autoDetectedPlayer.empty() ? autoDetectedPlayer : autoDetectedUuid;
+    }
+
+    std::wstring mcsrExtraHeadersW;
+    if (trackerCfg.useApiKey) {
+        std::string headerName = SanitizeHttpHeaderToken(trackerCfg.apiKeyHeader);
+        std::string headerValue = trackerCfg.apiKey;
+        TrimAsciiWhitespaceInPlace(headerValue);
+        if (headerName.empty()) headerName = "x-api-key";
+        if (!headerValue.empty()) {
+            mcsrExtraHeadersW = Utf8ToWide(headerName + ": " + headerValue + "\r\n");
+        }
+    }
+
+    MaybeRefreshMcsrUsernameIndex(mcsrExtraHeadersW, forceRefresh);
+
+    if (requestedIdentifier.empty()) {
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        s_mcsrApiTrackerState.enabled = true;
+        s_mcsrApiTrackerState.visible = runtimeVisible;
+        s_mcsrApiTrackerState.initializedVisibility = runtimeInitializedVisibility;
+        s_mcsrApiTrackerState.apiOnline = false;
+        s_mcsrApiTrackerState.autoDetectedPlayer = autoDetectedPlayer;
+        s_mcsrApiTrackerState.autoDetectedUuid = autoDetectedUuid;
+        s_mcsrApiTrackerState.requestedPlayer.clear();
+        s_mcsrApiTrackerState.displayPlayer.clear();
+        if (s_mcsrApiTrackerState.suggestedPlayers.empty()) {
+            MergeMcsrGlobalSuggestions(s_mcsrApiTrackerState.suggestedPlayers, kMcsrUsernameIndexMaxNames);
+        }
+        s_mcsrApiTrackerState.statusLabel =
+            trackerCfg.autoDetectPlayer ? "No Minecraft identity detected. Enter player in Ctrl+I -> MCSR."
+                                        : "Set player in Ctrl+I -> MCSR.";
+        return;
+    }
+
+    if (now < s_mcsrApiRateLimitUntil) {
+        const int waitSeconds =
+            std::max(1, static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(s_mcsrApiRateLimitUntil - now).count()));
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        s_mcsrApiTrackerState.enabled = true;
+        s_mcsrApiTrackerState.visible = runtimeVisible;
+        s_mcsrApiTrackerState.initializedVisibility = runtimeInitializedVisibility;
+        s_mcsrApiTrackerState.autoDetectedPlayer = autoDetectedPlayer;
+        s_mcsrApiTrackerState.autoDetectedUuid = autoDetectedUuid;
+        s_mcsrApiTrackerState.requestedPlayer = requestedIdentifier;
+        if (s_mcsrApiTrackerState.suggestedPlayers.empty()) {
+            MergeMcsrGlobalSuggestions(s_mcsrApiTrackerState.suggestedPlayers, kMcsrUsernameIndexMaxNames);
+        }
+        s_mcsrApiTrackerState.statusLabel = "MCSR API rate-limited (429). Retry in " + std::to_string(waitSeconds) + "s.";
+        return;
+    }
+
+    bool shouldPollNow = false;
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        shouldPollNow = forceRefresh || (s_mcsrApiTrackerState.requestedPlayer != requestedIdentifier) ||
+                        (s_mcsrApiTrackerState.autoDetectedPlayer != autoDetectedPlayer) ||
+                        (s_mcsrApiTrackerState.autoDetectedUuid != autoDetectedUuid);
+        if (!shouldPollNow && !refreshOnlyMode) { shouldPollNow = (now >= s_nextMcsrApiTrackerPollTime); }
+        s_mcsrApiTrackerState.enabled = true;
+        s_mcsrApiTrackerState.visible = runtimeVisible;
+        s_mcsrApiTrackerState.initializedVisibility = runtimeInitializedVisibility;
+        s_mcsrApiTrackerState.autoDetectedPlayer = autoDetectedPlayer;
+        s_mcsrApiTrackerState.autoDetectedUuid = autoDetectedUuid;
+        s_mcsrApiTrackerState.requestedPlayer = requestedIdentifier;
+    }
+    if (!shouldPollNow) {
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        if (s_mcsrApiTrackerState.suggestedPlayers.empty()) {
+            MergeMcsrGlobalSuggestions(s_mcsrApiTrackerState.suggestedPlayers, kMcsrUsernameIndexMaxNames);
+        }
+        return;
+    }
+
+    McsrApiTrackerRuntimeState cachedState;
+    std::time_t cachedSavedEpochSeconds = 0;
+    const bool hasCachedState = TryLoadMcsrTrackerCache(requestedIdentifier, autoDetectedUuid, cachedState, &cachedSavedEpochSeconds);
+
+    s_nextMcsrApiTrackerPollTime = now + std::chrono::milliseconds(pollIntervalMs);
+    bool rateLimitedThisCycle = false;
+
+    McsrApiTrackerRuntimeState next = previousState;
+    if (hasCachedState) {
+        next = cachedState;
+        ApplyMcsrTrackerRuntimeEnvelope(next, true, runtimeVisible, runtimeInitializedVisibility, autoDetectedPlayer, autoDetectedUuid,
+                                        requestedIdentifier);
+    } else {
+        ApplyMcsrTrackerRuntimeEnvelope(next, true, runtimeVisible, runtimeInitializedVisibility, autoDetectedPlayer, autoDetectedUuid,
+                                        requestedIdentifier);
+    }
+    MergeMcsrGlobalSuggestions(next.suggestedPlayers, kMcsrUsernameIndexMaxNames);
+    if (next.displayPlayer.empty()) next.displayPlayer = requestedIdentifier;
+
+    if (refreshOnlyMode && !forceRefresh && hasCachedState) {
+        std::string ageLabel = "cached";
+        const std::time_t nowEpoch = std::time(nullptr);
+        if (cachedSavedEpochSeconds > 0 && nowEpoch > cachedSavedEpochSeconds) {
+            const int ageMinutes = static_cast<int>((nowEpoch - cachedSavedEpochSeconds) / 60);
+            if (ageMinutes < 1) {
+                ageLabel = "just now";
+            } else if (ageMinutes < 60) {
+                ageLabel = std::to_string(ageMinutes) + "m ago";
+            } else {
+                ageLabel = std::to_string(ageMinutes / 60) + "h ago";
+            }
+        }
+        next.apiOnline = true;
+        next.statusLabel = "Cached data (" + ageLabel + "). Press Refresh for latest.";
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        s_mcsrApiTrackerState = std::move(next);
+        return;
+    }
+
+    auto requestUserByIdentifier = [&](const std::string& identifier, std::string& outJson, DWORD& outStatus, DWORD& outErr) -> bool {
+        const std::string encodedIdentifier = UrlEncodePathSegment(identifier);
+        const std::wstring userPath = L"/api/users/" + Utf8ToWide(encodedIdentifier);
+        return HttpGetMcsrJson(userPath, outJson, &outStatus, &outErr, mcsrExtraHeadersW);
+    };
+
+    std::string effectiveIdentifier = requestedIdentifier;
+    std::string userJson;
+    DWORD userStatusCode = 0;
+    DWORD userLastError = 0;
+    bool userFetchOk = requestUserByIdentifier(effectiveIdentifier, userJson, userStatusCode, userLastError);
+    if (!userFetchOk) {
+        // If auto-resolved username misses but we also have UUID, retry UUID once.
+        const bool isNotFoundLike = (userStatusCode == 400 || userStatusCode == 404);
+        if (manualPlayer.empty() && isNotFoundLike && !autoDetectedUuid.empty() &&
+            !EqualsIgnoreCaseAscii(effectiveIdentifier, autoDetectedUuid)) {
+            effectiveIdentifier = autoDetectedUuid;
+            userJson.clear();
+            userStatusCode = 0;
+            userLastError = 0;
+            userFetchOk = requestUserByIdentifier(effectiveIdentifier, userJson, userStatusCode, userLastError);
+        }
+    }
+    if (!userFetchOk) {
+        std::string failureLabel = "MCSR API offline.";
+        if (userStatusCode == 400 || userStatusCode == 404) {
+            failureLabel = "Player not found: " + effectiveIdentifier;
+        } else if (userStatusCode == 429) {
+            const int waitSeconds = RegisterMcsrApiRateLimitBackoff(pollIntervalMs);
+            failureLabel = "MCSR API rate-limited (429). Retry in " + std::to_string(waitSeconds) + "s.";
+            rateLimitedThisCycle = true;
+        } else if (userStatusCode >= 500 && userStatusCode <= 599) {
+            failureLabel = "MCSR API server error (" + std::to_string(userStatusCode) + ").";
+        } else if (userStatusCode >= 400 && userStatusCode <= 499) {
+            failureLabel = "MCSR API request rejected (" + std::to_string(userStatusCode) + ").";
+        } else if (userLastError != 0) {
+            failureLabel = "MCSR API network error (" + std::to_string(userLastError) + ").";
+        }
+
+        if (hasCachedState) {
+            next.apiOnline = true;
+            next.statusLabel = "Cached data active. " + failureLabel;
+        } else {
+            next.apiOnline = false;
+            next.statusLabel = std::move(failureLabel);
+        }
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        s_mcsrApiTrackerState = std::move(next);
+        return;
+    }
+
+    ParsedMcsrUserData userData = ParseMcsrUserPayload(userJson);
+    if (!userData.ok) {
+        if (hasCachedState) {
+            next.apiOnline = true;
+            next.statusLabel = "Cached data active. Player profile parse failed.";
+        } else {
+            next.apiOnline = false;
+            next.statusLabel = "Player not found.";
+        }
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        s_mcsrApiTrackerState = std::move(next);
+        return;
+    }
+
+    next.apiOnline = true;
+    next.recentWins = 0;
+    next.recentLosses = 0;
+    next.recentDraws = 0;
+    next.averageResultTimeMs = 0;
+    next.profileAverageTimeMs = 0;
+    next.recentForfeitRatePercent = 0.0f;
+    next.profileForfeitRatePercent = 0.0f;
+    next.lastMatchId.clear();
+    next.lastResultLabel.clear();
+    next.lastResultTimeMs = 0;
+    next.recentMatches.clear();
+    next.eloHistory.clear();
+    next.eloTrendPoints.clear();
+    next.splitLines.clear();
+    next.userUuid = userData.uuid;
+    if (!userData.nickname.empty()) next.displayPlayer = userData.nickname;
+    next.country = userData.country;
+    next.eloRank = userData.eloRank;
+    next.eloRate = userData.eloRate;
+    next.peakElo = (userData.peakElo > 0) ? userData.peakElo : userData.eloRate;
+    next.seasonWins = userData.seasonWinsRanked;
+    next.seasonLosses = userData.seasonLossesRanked;
+    next.seasonCompletions = userData.seasonCompletionsRanked;
+    next.seasonPoints = userData.seasonPointsRanked;
+    next.bestWinStreak = userData.bestWinStreak;
+    next.bestTimeMs = userData.bestTimeMs;
+    next.profileAverageTimeMs = std::max(0, userData.averageTimeMs);
+    if (userData.hasForfeitRatePercent) {
+        next.profileForfeitRatePercent = std::clamp(userData.forfeitRatePercent, 0.0f, 100.0f);
+    }
+    next.seasonFfs = userData.seasonFfsRanked;
+    next.seasonDodges = userData.seasonDodgesRanked;
+    next.seasonCurrentWinStreak = userData.seasonCurrentWinStreakRanked;
+    next.avatarImagePath.clear();
+    next.flagImagePath.clear();
+    {
+        const std::string avatarName = !next.displayPlayer.empty() ? next.displayPlayer : requestedIdentifier;
+        (void)TryCacheMcsrAvatar(avatarName, next.userUuid, next.avatarImagePath);
+        (void)TryCacheMcsrFlag(next.country, next.flagImagePath);
+    }
+
+    const std::string encodedPlayer = UrlEncodePathSegment(effectiveIdentifier);
+    const std::wstring matchesPath = L"/api/users/" + Utf8ToWide(encodedPlayer) + L"/matches?page=0";
+    std::string matchesJson;
+    ParsedMcsrMatchesData matchesData;
+    DWORD matchesStatusCode = 0;
+    DWORD matchesLastError = 0;
+    if (HttpGetMcsrJson(matchesPath, matchesJson, &matchesStatusCode, &matchesLastError, mcsrExtraHeadersW)) {
+        matchesData = ParseMcsrMatchesPayload(matchesJson, userData.uuid, userData.nickname);
+    } else if (matchesStatusCode == 429) {
+        const int waitSeconds = RegisterMcsrApiRateLimitBackoff(pollIntervalMs);
+        next.statusLabel = "MCSR API rate-limited (429). Retry in " + std::to_string(waitSeconds) + "s.";
+        rateLimitedThisCycle = true;
+    }
+
+    std::vector<ParsedMcsrMatchSummary> rankedMatches;
+    if (matchesData.ok) {
+        for (const ParsedMcsrMatchSummary& match : matchesData.matches) {
+            if (IsMcsrRankedMatch(match)) rankedMatches.push_back(match);
+        }
+    }
+
+    PushUniqueCaseInsensitive(next.suggestedPlayers, next.displayPlayer, kMcsrUsernameIndexMaxNames);
+    PushUniqueCaseInsensitive(next.suggestedPlayers, requestedIdentifier, kMcsrUsernameIndexMaxNames);
+    PushUniqueCaseInsensitive(next.suggestedPlayers, autoDetectedPlayer, kMcsrUsernameIndexMaxNames);
+    MergeMcsrGlobalSuggestions(next.suggestedPlayers, kMcsrUsernameIndexMaxNames);
+
+    const size_t recentLimit = std::min<size_t>(30, rankedMatches.size());
+    int recentForfeitCount = 0;
+    long long recentTimeTotalMs = 0;
+    int recentTimeCount = 0;
+    for (size_t i = 0; i < recentLimit; ++i) {
+        const ParsedMcsrMatchSummary& match = rankedMatches[i];
+        const int outcome = ClassifyMcsrMatchOutcome(match, userData);
+        if (outcome > 0) {
+            next.recentWins += 1;
+        } else if (outcome < 0) {
+            next.recentLosses += 1;
+        } else {
+            next.recentDraws += 1;
+        }
+        if (match.forfeited) recentForfeitCount += 1;
+        // result.time in this endpoint is the winner time; only include own completed wins for user avg.
+        if (match.resultTimeMs > 0 && outcome > 0 && !match.forfeited) {
+            recentTimeTotalMs += static_cast<long long>(match.resultTimeMs);
+            recentTimeCount += 1;
+        }
+
+        PushUniqueCaseInsensitive(next.suggestedPlayers, match.opponentName, kMcsrUsernameIndexMaxNames);
+        PushUniqueCaseInsensitive(next.suggestedPlayers, match.resultName, kMcsrUsernameIndexMaxNames);
+    }
+
+    if (matchesData.ok) {
+        const size_t panelLimit = std::min<size_t>(42, matchesData.matches.size());
+        for (size_t i = 0; i < panelLimit; ++i) {
+            const ParsedMcsrMatchSummary& match = matchesData.matches[i];
+            const int outcome = ClassifyMcsrMatchOutcome(match, userData);
+            McsrApiTrackerRuntimeState::MatchRow row;
+            row.opponent = match.opponentName.empty() ? "Unknown" : match.opponentName;
+            if (outcome > 0) {
+                row.resultType = 1;
+                row.resultLabel = "WON";
+            } else if (outcome < 0) {
+                row.resultType = -1;
+                row.resultLabel = "LOST";
+            } else {
+                row.resultType = 0;
+                row.resultLabel = "DRAW";
+            }
+            const bool hasTime = (match.resultTimeMs > 0);
+            const bool preferTime = hasTime && (outcome > 0 || !match.forfeited);
+            row.forfeited = match.forfeited && !preferTime;
+            row.detailLabel = preferTime ? FormatDurationMs(match.resultTimeMs) : (row.forfeited ? "FORFEIT" : FormatDurationMs(match.resultTimeMs));
+            row.ageLabel = FormatAgeShortFromEpoch(match.dateEpochSeconds);
+            row.categoryType = static_cast<int>(ClassifyMcsrMatchCategory(match));
+            next.recentMatches.push_back(std::move(row));
+
+            PushUniqueCaseInsensitive(next.suggestedPlayers, match.opponentName, kMcsrUsernameIndexMaxNames);
+            PushUniqueCaseInsensitive(next.suggestedPlayers, match.resultName, kMcsrUsernameIndexMaxNames);
+        }
+    }
+    if (recentLimit > 0) {
+        next.recentForfeitRatePercent = (100.0f * static_cast<float>(recentForfeitCount)) / static_cast<float>(recentLimit);
+    }
+    if (recentTimeCount > 0) {
+        next.averageResultTimeMs = static_cast<int>(recentTimeTotalMs / static_cast<long long>(recentTimeCount));
+    }
+    if (!userData.hasForfeitRatePercent && next.profileForfeitRatePercent <= 0.0f && next.recentForfeitRatePercent > 0.0f) {
+        next.profileForfeitRatePercent = next.recentForfeitRatePercent;
+    }
+
+    if (!rankedMatches.empty()) {
+        const ParsedMcsrMatchSummary& latest = rankedMatches.front();
+        const int outcome = ClassifyMcsrMatchOutcome(latest, userData);
+        next.lastMatchId = latest.id;
+        next.lastResultLabel = (outcome > 0) ? "WON" : ((outcome < 0) ? "LOST" : "DRAW");
+        next.lastResultTimeMs = latest.resultTimeMs;
+    }
+
+    {
+        const size_t trendLimit = std::min<size_t>(30, rankedMatches.size());
+        std::vector<int> newestToOldest;
+        std::vector<McsrApiTrackerRuntimeState::TrendPoint> newestToOldestTrend;
+        newestToOldest.reserve(trendLimit);
+        newestToOldestTrend.reserve(trendLimit);
+
+        int rollingElo = std::max(0, next.eloRate);
+        for (size_t i = 0; i < trendLimit; ++i) {
+            const ParsedMcsrMatchSummary& match = rankedMatches[i];
+            int eloAfter = rollingElo;
+            if (match.hasEloAfter) {
+                eloAfter = match.eloAfter;
+            } else if (rollingElo <= 0 && match.eloDelta != 0) {
+                eloAfter = std::max(0, rollingElo + match.eloDelta);
+            }
+
+            const int eloPoint = std::max(0, eloAfter);
+            newestToOldest.push_back(eloPoint);
+            rollingElo = std::max(0, eloAfter - match.eloDelta);
+
+            const int outcome = ClassifyMcsrMatchOutcome(match, userData);
+            McsrApiTrackerRuntimeState::TrendPoint trendPoint;
+            trendPoint.elo = eloPoint;
+            trendPoint.opponent = match.opponentName.empty() ? "Unknown" : match.opponentName;
+            trendPoint.resultLabel = (outcome > 0) ? "WON" : ((outcome < 0) ? "LOST" : "DRAW");
+            const bool hasTime = (match.resultTimeMs > 0);
+            const bool preferTime = hasTime && (outcome > 0 || !match.forfeited);
+            trendPoint.detailLabel =
+                preferTime ? FormatDurationMs(match.resultTimeMs) : (match.forfeited ? "FORFEIT" : FormatDurationMs(match.resultTimeMs));
+            trendPoint.ageLabel = FormatAgeShortFromEpoch(match.dateEpochSeconds);
+            newestToOldestTrend.push_back(std::move(trendPoint));
+        }
+
+        for (size_t i = newestToOldest.size(); i > 0; --i) {
+            next.eloHistory.push_back(newestToOldest[i - 1]);
+            next.eloTrendPoints.push_back(newestToOldestTrend[i - 1]);
+        }
+        if (next.eloHistory.empty()) {
+            next.eloHistory.push_back(std::max(0, next.eloRate));
+            McsrApiTrackerRuntimeState::TrendPoint trendPoint;
+            trendPoint.elo = std::max(0, next.eloRate);
+            trendPoint.resultLabel = "CURRENT";
+            trendPoint.detailLabel = "--";
+            trendPoint.ageLabel = "now";
+            next.eloTrendPoints.push_back(std::move(trendPoint));
+        } else if (next.eloRate > 0 && next.eloHistory.back() != next.eloRate) {
+            next.eloHistory.push_back(next.eloRate);
+            McsrApiTrackerRuntimeState::TrendPoint trendPoint;
+            trendPoint.elo = std::max(0, next.eloRate);
+            trendPoint.resultLabel = "CURRENT";
+            trendPoint.detailLabel = "--";
+            trendPoint.ageLabel = "now";
+            next.eloTrendPoints.push_back(std::move(trendPoint));
+        }
+    }
+
+    if (!next.lastMatchId.empty()) {
+        const std::wstring matchPath = L"/api/matches/" + Utf8ToWide(UrlEncodePathSegment(next.lastMatchId));
+        std::string matchJson;
+        DWORD matchStatusCode = 0;
+        DWORD matchLastError = 0;
+        if (HttpGetMcsrJson(matchPath, matchJson, &matchStatusCode, &matchLastError, mcsrExtraHeadersW)) {
+            ParsedMcsrMatchDetailData matchDetail = ParseMcsrMatchDetailPayload(matchJson, next.userUuid);
+            if (matchDetail.ok) {
+                if (next.lastResultTimeMs <= 0 && matchDetail.completionTimeMs > 0) { next.lastResultTimeMs = matchDetail.completionTimeMs; }
+                std::unordered_set<int> seenTypes;
+                for (const ParsedMcsrTimelineSplit& split : matchDetail.splits) {
+                    if (!seenTypes.insert(split.type).second) continue;
+                    next.splitLines.push_back(McsrTimelineTypeLabel(split.type) + " " + FormatDurationMs(split.timeMs));
+                    if (next.splitLines.size() >= 6) break;
+                }
+            }
+        } else if (matchStatusCode == 429) {
+            const int waitSeconds = RegisterMcsrApiRateLimitBackoff(pollIntervalMs);
+            next.statusLabel = "MCSR API rate-limited (429). Retry in " + std::to_string(waitSeconds) + "s.";
+            rateLimitedThisCycle = true;
+        }
+    }
+
+    if (next.apiOnline && !rateLimitedThisCycle) { next.statusLabel.clear(); }
+    if (!rateLimitedThisCycle) { ResetMcsrApiRateLimitBackoff(); }
+    if (next.apiOnline) { SaveMcsrTrackerCache(requestedIdentifier, next); }
+
+    std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+    s_mcsrApiTrackerState = std::move(next);
 }
 } // namespace
 
@@ -3399,9 +6345,73 @@ void CheckWorldExitReset() {
     // Get current game state from lock-free buffer
     std::string currentGameState = g_gameStateBuffers[g_currentGameStateIndex.load(std::memory_order_acquire)];
     bool isInWorld = (currentGameState.find("inworld") != std::string::npos);
+    static bool s_visualEffectsRetryPending = false;
+    static ULONGLONG s_visualEffectsRetryAtMs = 0;
+    static bool s_visualEffectsNoStateApplied = false;
+    static bool s_visualEffectsNoStateRetryPending = false;
+    static ULONGLONG s_visualEffectsNoStateRetryAtMs = 0;
+    static ULONGLONG s_visualEffectsNoStateFirstSeenMs = 0;
+    const ULONGLONG nowMs = GetTickCount64();
+
+    // Fallback: if State Output isn't available, we cannot observe world-enter transitions.
+    // Apply once after startup and retry once, so configured values still land without manual Apply.
+    if (!g_isStateOutputAvailable.load(std::memory_order_acquire)) {
+        if (s_visualEffectsNoStateFirstSeenMs == 0) { s_visualEffectsNoStateFirstSeenMs = nowMs; }
+        if (!s_visualEffectsNoStateApplied && nowMs - s_visualEffectsNoStateFirstSeenMs >= 12000) {
+            RequestVisualEffectsApplyOnWorldEnter();
+            s_visualEffectsNoStateApplied = true;
+            s_visualEffectsNoStateRetryPending = true;
+            s_visualEffectsNoStateRetryAtMs = nowMs + 5000;
+            Log("[LogicThread] State Output unavailable; applied visual-effects fallback.");
+        } else if (s_visualEffectsNoStateRetryPending && nowMs >= s_visualEffectsNoStateRetryAtMs) {
+            RequestVisualEffectsApplyOnWorldEnter();
+            s_visualEffectsNoStateRetryPending = false;
+            Log("[LogicThread] State Output unavailable; applied visual-effects fallback retry.");
+        }
+    } else {
+        s_visualEffectsNoStateFirstSeenMs = 0;
+    }
+
+    // Transitioning from "not in world" to "in world" - apply configured visual effects.
+    if (!s_wasInWorld && isInWorld) {
+        if (g_captureCursorOnWorldEnter.exchange(false, std::memory_order_acq_rel)) {
+            g_showGui.store(false, std::memory_order_release);
+            HWND hwnd = g_minecraftHwnd.load(std::memory_order_relaxed);
+            if (hwnd != NULL) {
+                SetForegroundWindow(hwnd);
+                SetActiveWindow(hwnd);
+                SetFocus(hwnd);
+            }
+            RECT fullScreenRect;
+            fullScreenRect.left = 0;
+            fullScreenRect.top = 0;
+            fullScreenRect.right = GetCachedScreenWidth();
+            fullScreenRect.bottom = GetCachedScreenHeight();
+            ClipCursor(&fullScreenRect);
+            SetCursor(NULL);
+            Log("[Practice] Applied cursor recapture on world-enter.");
+        }
+
+        RequestVisualEffectsApplyOnWorldEnter();
+        // Some mods/settings systems can overwrite values shortly after world join.
+        // Schedule one delayed re-apply to make startup behavior deterministic.
+        s_visualEffectsRetryPending = true;
+        s_visualEffectsRetryAtMs = nowMs + 5000;
+    }
+
+    if (isInWorld && s_visualEffectsRetryPending && nowMs >= s_visualEffectsRetryAtMs) {
+        RequestVisualEffectsApplyOnWorldEnter();
+        s_visualEffectsRetryPending = false;
+    }
 
     // Transitioning from "in world" to "not in world" - reset all secondary modes
     if (s_wasInWorld && !isInWorld) {
+        s_visualEffectsRetryPending = false;
+        s_visualEffectsRetryAtMs = 0;
+        s_visualEffectsNoStateApplied = false;
+        s_visualEffectsNoStateRetryPending = false;
+        s_visualEffectsNoStateRetryAtMs = 0;
+        s_visualEffectsNoStateFirstSeenMs = 0;
         auto cfgSnap = GetConfigSnapshot();
         if (cfgSnap) {
             const Config& cfg = *cfgSnap;
@@ -3556,11 +6566,13 @@ void UpdateStrongholdOverlayState() {
     auto cfgSnap = GetConfigSnapshot();
     if (!cfgSnap) return;
     StrongholdOverlayConfig overlayCfg = cfgSnap->strongholdOverlay;
+    McsrTrackerOverlayConfig mcsrTrackerCfg = cfgSnap->mcsrTrackerOverlay;
     // Standalone-only release: force local clipboard pipeline and disable backend management.
     overlayCfg.standaloneClipboardMode = true;
     overlayCfg.manageNinjabrainBotProcess = false;
     overlayCfg.autoStartNinjabrainBot = false;
     overlayCfg.hideNinjabrainBotWindow = false;
+    UpdateMcsrApiTrackerState(mcsrTrackerCfg);
 
     {
         std::lock_guard<std::mutex> lock(s_strongholdOverlayMutex);
@@ -4120,6 +7132,148 @@ StrongholdOverlayRenderSnapshot GetStrongholdOverlayRenderSnapshot() {
     snapshot.showComputedDetails = s_strongholdOverlayState.showComputedDetails;
 
     return snapshot;
+}
+
+McsrApiTrackerRenderSnapshot GetMcsrApiTrackerRenderSnapshot() {
+    McsrApiTrackerRenderSnapshot snapshot;
+
+    auto cfgSnap = GetConfigSnapshot();
+    if (!cfgSnap) return snapshot;
+
+    const McsrTrackerOverlayConfig& trackerCfg = cfgSnap->mcsrTrackerOverlay;
+    snapshot.enabled = trackerCfg.enabled;
+    snapshot.renderInGameOverlay = trackerCfg.renderInGameOverlay;
+    snapshot.refreshOnlyMode = trackerCfg.refreshOnlyMode;
+    snapshot.scale = std::clamp(trackerCfg.scale, 0.4f, 3.0f);
+    snapshot.overlayOpacity = std::clamp(trackerCfg.opacity, 0.0f, 1.0f);
+    snapshot.backgroundOpacity = std::clamp(trackerCfg.backgroundOpacity, 0.0f, 1.0f);
+    snapshot.x = trackerCfg.x;
+    snapshot.y = trackerCfg.y;
+    if (!snapshot.enabled) return snapshot;
+
+    McsrApiTrackerRuntimeState state;
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+        if (!s_mcsrApiTrackerState.initializedVisibility) {
+            s_mcsrApiTrackerState.visible = false;
+            s_mcsrApiTrackerState.initializedVisibility = true;
+        }
+        s_mcsrApiTrackerState.enabled = trackerCfg.enabled;
+        state = s_mcsrApiTrackerState;
+    }
+
+    snapshot.visible = state.visible;
+    if (!snapshot.visible) return snapshot;
+
+    snapshot.apiOnline = state.apiOnline;
+    snapshot.headerLabel = state.displayPlayer.empty() ? "MCSR Ranked" : state.displayPlayer;
+    snapshot.statusLabel = state.statusLabel;
+    snapshot.displayPlayer = state.displayPlayer;
+    snapshot.requestedPlayer = state.requestedPlayer;
+    snapshot.autoDetectedPlayer = !state.autoDetectedPlayer.empty() ? state.autoDetectedPlayer : state.autoDetectedUuid;
+    snapshot.avatarImagePath = state.avatarImagePath;
+    snapshot.flagImagePath = state.flagImagePath;
+    snapshot.country = state.country;
+    snapshot.eloRank = state.eloRank;
+    snapshot.eloRate = state.eloRate;
+    snapshot.peakElo = state.peakElo;
+    snapshot.seasonWins = state.seasonWins;
+    snapshot.seasonLosses = state.seasonLosses;
+    snapshot.seasonCompletions = state.seasonCompletions;
+    snapshot.seasonBestWinStreak = state.bestWinStreak;
+    snapshot.seasonPoints = state.seasonPoints;
+    snapshot.bestTimeMs = state.bestTimeMs;
+    snapshot.averageResultTimeMs = state.averageResultTimeMs;
+    snapshot.profileAverageTimeMs = state.profileAverageTimeMs;
+    snapshot.recentWins = state.recentWins;
+    snapshot.recentLosses = state.recentLosses;
+    snapshot.recentDraws = state.recentDraws;
+    snapshot.recentForfeitRatePercent = state.recentForfeitRatePercent;
+    snapshot.profileForfeitRatePercent = state.profileForfeitRatePercent;
+    snapshot.eloHistory = state.eloHistory;
+    snapshot.eloTrendPoints.reserve(state.eloTrendPoints.size());
+    for (const McsrApiTrackerRuntimeState::TrendPoint& row : state.eloTrendPoints) {
+        McsrApiTrackerRenderSnapshot::TrendPoint outRow;
+        outRow.elo = row.elo;
+        outRow.opponent = row.opponent;
+        outRow.resultLabel = row.resultLabel;
+        outRow.detailLabel = row.detailLabel;
+        outRow.ageLabel = row.ageLabel;
+        snapshot.eloTrendPoints.push_back(std::move(outRow));
+    }
+    snapshot.suggestedPlayers = state.suggestedPlayers;
+    snapshot.recentMatches.reserve(state.recentMatches.size());
+    for (const McsrApiTrackerRuntimeState::MatchRow& row : state.recentMatches) {
+        McsrApiTrackerRenderSnapshot::MatchRow outRow;
+        outRow.opponent = row.opponent;
+        outRow.resultLabel = row.resultLabel;
+        outRow.detailLabel = row.detailLabel;
+        outRow.ageLabel = row.ageLabel;
+        outRow.resultType = row.resultType;
+        outRow.forfeited = row.forfeited;
+        outRow.categoryType = row.categoryType;
+        snapshot.recentMatches.push_back(std::move(outRow));
+    }
+
+    return snapshot;
+}
+
+void RequestMcsrApiTrackerRefresh() { s_mcsrApiTrackerForceRefresh.store(true, std::memory_order_relaxed); }
+
+void SetMcsrApiTrackerSearchPlayer(const std::string& playerName) {
+    std::string value = playerName;
+    TrimAsciiWhitespaceInPlace(value);
+    if (value.size() > 64) value.resize(64);
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrSearchOverrideMutex);
+        s_mcsrSearchOverridePlayer = value;
+    }
+    s_mcsrApiTrackerForceRefresh.store(true, std::memory_order_relaxed);
+}
+
+void ClearMcsrApiTrackerSearchPlayer() {
+    {
+        std::lock_guard<std::mutex> lock(s_mcsrSearchOverrideMutex);
+        s_mcsrSearchOverridePlayer.clear();
+    }
+    s_mcsrApiTrackerForceRefresh.store(true, std::memory_order_relaxed);
+}
+
+bool ShouldAllowMcsrTrackerUiInput() {
+    auto cfgSnap = GetConfigSnapshot();
+    if (!cfgSnap) return false;
+
+    const McsrTrackerOverlayConfig& trackerCfg = cfgSnap->mcsrTrackerOverlay;
+    if (!trackerCfg.enabled || !trackerCfg.renderInGameOverlay) return false;
+
+    const std::string gameState = g_gameStateBuffers[g_currentGameStateIndex.load(std::memory_order_acquire)];
+    if (gameState.find("inworld") != std::string::npos) return false;
+
+    std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+    if (!s_mcsrApiTrackerState.initializedVisibility) return false;
+    return s_mcsrApiTrackerState.visible;
+}
+
+bool HandleMcsrTrackerOverlayToggleHotkey(unsigned int keyVk, bool ctrlDown, bool shiftDown, bool altDown) {
+    auto cfgSnap = GetConfigSnapshot();
+    if (!cfgSnap) return false;
+    const McsrTrackerOverlayConfig& trackerCfg = cfgSnap->mcsrTrackerOverlay;
+    if (!trackerCfg.enabled) return false;
+
+    const unsigned int configuredVk = static_cast<unsigned int>(std::clamp(trackerCfg.hotkeyKey, 1, 255));
+    if (keyVk != configuredVk) return false;
+    if (ctrlDown != trackerCfg.hotkeyCtrl) return false;
+    if (shiftDown != trackerCfg.hotkeyShift) return false;
+    if (altDown != trackerCfg.hotkeyAlt) return false;
+
+    std::lock_guard<std::mutex> lock(s_mcsrApiTrackerMutex);
+    if (!s_mcsrApiTrackerState.initializedVisibility) {
+        s_mcsrApiTrackerState.visible = false;
+        s_mcsrApiTrackerState.initializedVisibility = true;
+    }
+    s_mcsrApiTrackerState.visible = !s_mcsrApiTrackerState.visible;
+    s_mcsrApiTrackerState.enabled = trackerCfg.enabled;
+    return true;
 }
 
 bool HandleStrongholdOverlayHotkeyH(bool shiftDown, bool ctrlDown) {

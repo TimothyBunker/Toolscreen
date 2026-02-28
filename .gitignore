@@ -14,3 +14,15 @@
 !third_party/**
 !scripts/
 !scripts/**
+scripts/__pycache__/
+scripts/**/*.pyc
+!mcsr_username_index.txt
+!mcsr_username_index.txt.meta.json
+
+# Security/data hygiene: never commit local cache databases.
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
